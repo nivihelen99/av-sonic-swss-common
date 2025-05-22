@@ -275,3 +275,186 @@ TEST_F(MultiNotificationConsumerTest, MultipleMessagesSameChannel) {
 // Also, testing error conditions from Redis (e.g., connection drops) is harder
 // in unit tests without a mock Redis or fault injection.
 // The current tests assume a healthy Redis connection.
+
+TEST_F(MultiNotificationConsumerTest, UnsubscribeSingleChannel) {
+    std::vector<std::string> channels = {"US_CH1_S", "US_CH2_S", "US_CH3_S"};
+    swss::MultiNotificationConsumer consumer(&m_db, channels);
+
+    // Initial messages to make sure subscriptions are active
+    publishMessage(channels[0], "INIT_OP", "INIT_KEY_CH1", {{"f", "v"}});
+    publishMessage(channels[1], "INIT_OP", "INIT_KEY_CH2", {{"f", "v"}});
+    publishMessage(channels[2], "INIT_OP", "INIT_KEY_CH3", {{"f", "v"}});
+    usleep(100000); // 100ms
+
+    std::deque<swss::ChannelKeyOpFieldsValuesTuple> received_msgs;
+    int initial_peek = consumer.peek();
+    if (initial_peek > 0) consumer.pops(received_msgs);
+    ASSERT_EQ(received_msgs.size(), 3) << "Should receive initial 3 messages";
+    received_msgs.clear();
+
+    // Unsubscribe from the middle channel
+    consumer.unsubscribe({channels[1]}); // Unsubscribe US_CH2_S
+    usleep(100000); // Allow time for unsubscribe to process by Redis & client
+
+    // New messages after unsubscribe
+    publishMessage(channels[0], "NEXT_OP", "NEXT_KEY_CH1", {{"f", "vN1"}}); // Should be received
+    publishMessage(channels[1], "NEXT_OP", "NEXT_KEY_CH2", {{"f", "vN2"}}); // Should NOT be received
+    publishMessage(channels[2], "NEXT_OP", "NEXT_KEY_CH3", {{"f", "vN3"}}); // Should be received
+    usleep(100000);
+
+    int peek_val = consumer.peek();
+    if (peek_val > 0) {
+        consumer.pops(received_msgs);
+    }
+    
+    // Might have received 0, 1, or 2 messages. Should not be 3.
+    ASSERT_LE(received_msgs.size(), (size_t)2);
+
+    bool found_ch1_next = false;
+    bool found_ch2_next = false; // This should remain false
+    bool found_ch3_next = false;
+
+    for (const auto& msg_tuple : received_msgs) {
+        const std::string& chan = ckfvChannel(msg_tuple);
+        const std::string& key = ckfvKey(msg_tuple);
+        if (chan == channels[0] && key == "NEXT_KEY_CH1") found_ch1_next = true;
+        if (chan == channels[1] && key == "NEXT_KEY_CH2") found_ch2_next = true;
+        if (chan == channels[2] && key == "NEXT_KEY_CH3") found_ch3_next = true;
+    }
+
+    ASSERT_TRUE(found_ch1_next) << "Did not find message from " << channels[0];
+    ASSERT_FALSE(found_ch2_next) << "Found message from unsubscribed channel " << channels[1];
+    ASSERT_TRUE(found_ch3_next) << "Did not find message from " << channels[2];
+
+    // Final check: publish only to CH2 and ensure nothing is popped
+    received_msgs.clear();
+    publishMessage(channels[1], "FINAL_OP", "FINAL_KEY_CH2", {{"f", "vF"}});
+    usleep(100000);
+    peek_val = consumer.peek();
+    if (peek_val > 0) { // Should be 0 if only CH2 was published to and we are unsubscribed
+        consumer.pops(received_msgs);
+    }
+    ASSERT_TRUE(received_msgs.empty()) << "Received messages when only unsubscribed channel had new data.";
+}
+
+TEST_F(MultiNotificationConsumerTest, UnsubscribeMultipleChannels) {
+    std::vector<std::string> channels = {"US_CH1_M", "US_CH2_M", "US_CH3_M"};
+    swss::MultiNotificationConsumer consumer(&m_db, channels);
+
+    publishMessage(channels[0], "INIT_OP", "INIT_KEY_CH1M", {});
+    publishMessage(channels[1], "INIT_OP", "INIT_KEY_CH2M", {});
+    publishMessage(channels[2], "INIT_OP", "INIT_KEY_CH3M", {});
+    usleep(100000);
+    std::deque<swss::ChannelKeyOpFieldsValuesTuple> received_msgs;
+    if(consumer.peek() > 0) consumer.pops(received_msgs);
+    ASSERT_EQ(received_msgs.size(), 3);
+    received_msgs.clear();
+
+    // Unsubscribe from US_CH2_M and US_CH3_M
+    consumer.unsubscribe({channels[1], channels[2]});
+    usleep(100000);
+
+    publishMessage(channels[0], "NEXT_OP", "NEXT_KEY_CH1M", {}); // Should be received
+    publishMessage(channels[1], "NEXT_OP", "NEXT_KEY_CH2M", {}); // Should NOT be received
+    publishMessage(channels[2], "NEXT_OP", "NEXT_KEY_CH3M", {}); // Should NOT be received
+    usleep(100000);
+
+    if(consumer.peek() > 0) consumer.pops(received_msgs);
+    
+    ASSERT_LE(received_msgs.size(), (size_t)1);
+
+    bool found_ch1_next = false;
+    bool found_ch2_next = false;
+    bool found_ch3_next = false;
+
+    for (const auto& msg_tuple : received_msgs) {
+        const std::string& chan = ckfvChannel(msg_tuple);
+        const std::string& key = ckfvKey(msg_tuple);
+        if (chan == channels[0] && key == "NEXT_KEY_CH1M") found_ch1_next = true;
+        if (chan == channels[1] && key == "NEXT_KEY_CH2M") found_ch2_next = true;
+        if (chan == channels[2] && key == "NEXT_KEY_CH3M") found_ch3_next = true;
+    }
+
+    ASSERT_TRUE(found_ch1_next);
+    ASSERT_FALSE(found_ch2_next);
+    ASSERT_FALSE(found_ch3_next);
+
+    // Final check
+    received_msgs.clear();
+    publishMessage(channels[1], "FINAL_OP", "FINAL_KEY_CH2M", {});
+    publishMessage(channels[2], "FINAL_OP", "FINAL_KEY_CH3M", {});
+    usleep(100000);
+    if(consumer.peek() > 0) consumer.pops(received_msgs);
+    ASSERT_TRUE(received_msgs.empty());
+}
+
+TEST_F(MultiNotificationConsumerTest, UnsubscribeNonSubscribedChannel) {
+    std::vector<std::string> channels = {"US_CH1_N", "US_CH2_N"};
+    swss::MultiNotificationConsumer consumer(&m_db, channels);
+
+    publishMessage(channels[0], "INIT_OP", "INIT_KEY_CH1N", {});
+    publishMessage(channels[1], "INIT_OP", "INIT_KEY_CH2N", {});
+    usleep(100000);
+    std::deque<swss::ChannelKeyOpFieldsValuesTuple> received_msgs;
+    if(consumer.peek() > 0) consumer.pops(received_msgs);
+    ASSERT_EQ(received_msgs.size(), 2);
+    received_msgs.clear();
+
+    // Unsubscribe from a non-existent channel and one existing + one non-existent
+    consumer.unsubscribe({"NON_EXISTENT_CHANNEL"});
+    usleep(50000); // Shorter delay, as Redis won't do much
+    consumer.unsubscribe({channels[0], "NON_EXISTENT_CHANNEL_2"}); // Unsubscribe from CH1
+    usleep(100000);
+
+
+    publishMessage(channels[0], "NEXT_OP", "NEXT_KEY_CH1N", {}); // Should NOT be received
+    publishMessage(channels[1], "NEXT_OP", "NEXT_KEY_CH2N", {}); // Should be received
+    usleep(100000);
+
+    if(consumer.peek() > 0) consumer.pops(received_msgs);
+    
+    ASSERT_LE(received_msgs.size(), (size_t)1); // Only CH2 message should come
+
+    bool found_ch1_next = false;
+    bool found_ch2_next = false;
+
+    for (const auto& msg_tuple : received_msgs) {
+        const std::string& chan = ckfvChannel(msg_tuple);
+        const std::string& key = ckfvKey(msg_tuple);
+        if (chan == channels[0] && key == "NEXT_KEY_CH1N") found_ch1_next = true;
+        if (chan == channels[1] && key == "NEXT_KEY_CH2N") found_ch2_next = true;
+    }
+
+    ASSERT_FALSE(found_ch1_next) << "Message from " << channels[0] << " (which should be unsubscribed) was received.";
+    ASSERT_TRUE(found_ch2_next) << "Message from " << channels[1] << " (which should still be subscribed) was not received.";
+}
+
+TEST_F(MultiNotificationConsumerTest, UnsubscribeAllChannels) {
+    std::vector<std::string> channels = {"US_CH1_ALL", "US_CH2_ALL"};
+    swss::MultiNotificationConsumer consumer(&m_db, channels);
+
+    publishMessage(channels[0], "INIT_OP", "INIT_KEY_CH1A", {});
+    publishMessage(channels[1], "INIT_OP", "INIT_KEY_CH2A", {});
+    usleep(100000);
+    std::deque<swss::ChannelKeyOpFieldsValuesTuple> received_msgs;
+    if(consumer.peek() > 0) consumer.pops(received_msgs);
+    ASSERT_EQ(received_msgs.size(), 2);
+    received_msgs.clear();
+
+    // Unsubscribe from all channels
+    consumer.unsubscribe({channels[0], channels[1]});
+    usleep(100000);
+
+    publishMessage(channels[0], "NEXT_OP", "NEXT_KEY_CH1A", {}); // Should NOT be received
+    publishMessage(channels[1], "NEXT_OP", "NEXT_KEY_CH2A", {}); // Should NOT be received
+    usleep(100000);
+
+    // Peek should return 0 (no data) or possibly -1 (error, but less likely here)
+    // It should not be positive.
+    int peek_val = consumer.peek();
+    ASSERT_LE(peek_val, 0) << "Peek returned > 0 after unsubscribing from all channels and publishing new messages.";
+
+    consumer.pops(received_msgs); // Attempt to pop
+    ASSERT_TRUE(received_msgs.empty()) << "Received messages after unsubscribing from all channels.";
+}
+

@@ -1,6 +1,7 @@
 #include "multinotificationconsumer.h"
 
 #include <iostream> // For potential debugging, can be removed later
+#include <algorithm> // For std::remove_if, std::find
 #include "redisapi.h" // For peekRedisContext, etc.
 
 #define NOTIFICATION_SUBSCRIBE_TIMEOUT (1000) // Same as NotificationConsumer
@@ -221,19 +222,22 @@ void MultiNotificationConsumer::processReply(redisReply *reply)
 
     if (reply->elements != REDIS_PUB_SUB_MESSAGE_ELEMENTS)
     {
-        // This could also be a reply to the initial SUBSCRIBE command if not handled by RedisReply in subscribe()
+        // This could also be a reply to the initial SUBSCRIBE/UNSUBSCRIBE command.
         // For actual messages, it must be 3 elements.
-        // Let's check if it's a subscribe confirmation, which we should ignore here.
-        if (reply->elements > 0 && reply->element[REDIS_PUB_SUB_MESSAGE_TYPE_INDEX]->type == REDIS_REPLY_STRING &&
-            (std::string(reply->element[REDIS_PUB_SUB_MESSAGE_TYPE_INDEX]->str) == "subscribe" ||
-             std::string(reply->element[REDIS_PUB_SUB_MESSAGE_TYPE_INDEX]->str) == "psubscribe" ||
-             std::string(reply->element[REDIS_PUB_SUB_MESSAGE_TYPE_INDEX]->str) == "unsubscribe"))
+        // Check if it's a subscribe, psubscribe, or unsubscribe confirmation.
+        if (reply->elements > 0 && reply->element[REDIS_PUB_SUB_MESSAGE_TYPE_INDEX]->type == REDIS_REPLY_STRING)
         {
-            SWSS_LOG_DEBUG("Received '%s' confirmation, not a message. Ignoring.", reply->element[REDIS_PUB_SUB_MESSAGE_TYPE_INDEX]->str);
-            return;
+            std::string type_str = reply->element[REDIS_PUB_SUB_MESSAGE_TYPE_INDEX]->str;
+            if (type_str == "subscribe" || type_str == "psubscribe" || type_str == "unsubscribe")
+            {
+                SWSS_LOG_DEBUG("Received '%s' confirmation, not a message. Channel: %s. Ignoring.", 
+                               type_str.c_str(), 
+                               (reply->elements > 1 && reply->element[REDIS_PUB_SUB_CHANNEL_INDEX]->type == REDIS_REPLY_STRING && reply->element[REDIS_PUB_SUB_CHANNEL_INDEX]->str) ? reply->element[REDIS_PUB_SUB_CHANNEL_INDEX]->str : "N/A");
+                return;
+            }
         }
 
-        SWSS_LOG_ERROR("Expected %d elements in redis PUB/SUB reply, got: %zu. First element type: %d, value: %s",
+        SWSS_LOG_ERROR("Expected %d elements in redis PUB/SUB reply for a message, got: %zu. First element type: %d, value: %s",
                        REDIS_PUB_SUB_MESSAGE_ELEMENTS,
                        reply->elements,
                        reply->element[REDIS_PUB_SUB_MESSAGE_TYPE_INDEX]->type,
@@ -402,6 +406,109 @@ int MultiNotificationConsumer::peek()
         }
     }
     return m_queue.empty() ? 0 : 1;
+}
+
+void MultiNotificationConsumer::unsubscribe(const std::vector<std::string>& channels_to_unsubscribe)
+{
+    SWSS_LOG_ENTER();
+
+    if (channels_to_unsubscribe.empty())
+    {
+        SWSS_LOG_INFO("No channels provided to unsubscribe from.");
+        return;
+    }
+
+    if (!m_subscribe || !m_subscribe->getContext())
+    {
+        SWSS_LOG_ERROR("Subscription DB connector is not initialized. Cannot unsubscribe.");
+        // Depending on desired error handling, could throw an exception.
+        // For now, logging and returning to match some existing patterns.
+        return;
+    }
+
+    std::string cmd = "UNSUBSCRIBE";
+    std::vector<std::string> actually_unsubscribing_from; // Channels that are in m_channels and in channels_to_unsubscribe
+
+    for (const auto& channel : channels_to_unsubscribe)
+    {
+        // Only try to unsubscribe if we think we are subscribed
+        if (std::find(m_channels.begin(), m_channels.end(), channel) != m_channels.end()) {
+            cmd += " " + channel;
+            actually_unsubscribing_from.push_back(channel);
+        } else {
+            SWSS_LOG_INFO("Not currently subscribed to channel '%s', skipping unsubscription for it.", channel.c_str());
+        }
+    }
+
+    // If all channels_to_unsubscribe were not in m_channels
+    if (cmd == "UNSUBSCRIBE") { // Or check actually_unsubscribing_from.empty()
+        SWSS_LOG_INFO("None of the provided channels were in the current subscription list to send UNSUBSCRIBE command.");
+        return;
+    }
+
+    try
+    {
+        RedisReply r(m_subscribe, cmd, REDIS_REPLY_ARRAY); // Expecting batched replies
+
+        // Verify unsubscribe replies from Redis
+        // Each successful unsubscription yields a 3-element array:
+        // ["unsubscribe", channel_name, num_remaining_subscriptions]
+        for (size_t i = 0; i < actually_unsubscribing_from.size(); ++i)
+        {
+            const std::string& channel_being_unsubscribed = actually_unsubscribing_from[i];
+            redisReply *raw_reply = r.getReply(); // Get the current part of the batched reply
+
+            if (!raw_reply || raw_reply->type != REDIS_REPLY_ARRAY || raw_reply->elements != 3)
+            {
+                SWSS_LOG_ERROR("Unexpected reply format during UNSUBSCRIBE for channel %s", channel_being_unsubscribed.c_str());
+            }
+            else if (std::string(raw_reply->element[0]->str) != "unsubscribe" ||
+                     std::string(raw_reply->element[1]->str) != channel_being_unsubscribed)
+            {
+                SWSS_LOG_ERROR("Unexpected content in UNSUBSCRIBE reply for channel %s (got type '%s' for channel '%s')",
+                               channel_being_unsubscribed.c_str(),
+                               raw_reply->element[0]->str ? raw_reply->element[0]->str : "null",
+                               raw_reply->element[1]->str ? raw_reply->element[1]->str : "null");
+            }
+            else
+            {
+                SWSS_LOG_INFO("Successfully received UNSUBSCRIBE confirmation from Redis for channel: %s. Remaining subscriptions reported by Redis: %lld",
+                              channel_being_unsubscribed.c_str(), raw_reply->element[2]->integer);
+            }
+
+            if (i < actually_unsubscribing_from.size() - 1) { // If there are more replies expected for this command
+                r.next(); // Advance to the next part of the batched reply.
+            }
+        }
+        SWSS_LOG_INFO("Processed UNSUBSCRIBE command for %zu channels.", actually_unsubscribing_from.size());
+    }
+    catch (const std::exception &e)
+    {
+        SWSS_LOG_ERROR("Exception during UNSUBSCRIBE command: %s", e.what());
+        // Even if command fails, proceed to update m_channels based on what we intended to unsubscribe.
+    }
+    catch (...)
+    {
+        SWSS_LOG_ERROR("Unknown exception during UNSUBSCRIBE command.");
+        // Proceed to update m_channels
+    }
+
+    // Update internal list of subscribed channels using remove_if and find
+    m_channels.erase(
+        std::remove_if(m_channels.begin(), m_channels.end(),
+                       [&channels_to_unsubscribe](const std::string& current_channel) {
+                           return std::find(channels_to_unsubscribe.begin(),
+                                            channels_to_unsubscribe.end(),
+                                            current_channel) != channels_to_unsubscribe.end();
+                       }),
+        m_channels.end());
+
+    SWSS_LOG_INFO("Number of active subscriptions in m_channels now: %zu", m_channels.size());
+    if (m_channels.empty()) {
+        SWSS_LOG_WARN("MultiNotificationConsumer is no longer subscribed to any channels internally.");
+        // Note: The m_subscribe connection remains open but idle.
+        // It will be closed when the MultiNotificationConsumer is destructed.
+    }
 }
 
 } // namespace swss

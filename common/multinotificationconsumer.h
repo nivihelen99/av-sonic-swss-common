@@ -40,6 +40,9 @@ public:
     //    -1 - error during peeking redis socket
     int peek();
 
+    // Unsubscribes from the specified channels.
+    void unsubscribe(const std::vector<std::string>& channels_to_unsubscribe);
+
     ~MultiNotificationConsumer() override;
 
     int getFd() override;
