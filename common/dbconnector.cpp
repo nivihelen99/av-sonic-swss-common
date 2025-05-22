@@ -125,6 +125,7 @@ void SonicDBConfig::initializeGlobalConfig(const string &file)
                 // skip initializing it here again.
                 if (key.isEmpty() && m_init)
                 {
+                    SWSS_LOG_DEBUG("Default database configuration already initialized by SonicDBConfig::initialize. Skipping redundant parse in initializeGlobalConfig.");
                     continue;
                 }
 
@@ -135,7 +136,7 @@ void SonicDBConfig::initializeGlobalConfig(const string &file)
 
                 if(key.isEmpty())
                 {
-                    // Make regular init also done
+                    // Make regular init also done if it was not true already
                     m_init = true;
                 }
             }
@@ -932,7 +933,7 @@ shared_ptr<string> DBConnector::hget(const string &key, const string &field)
     }
 
     SWSS_LOG_ERROR("HGET failed, reply-type: %d, %s: %s", reply->type, key.c_str(), field.c_str());
-    throw runtime_error("HGET failed, unexpected reply type, memory exception");
+    throw runtime_error("HGET failed, unexpected Redis reply type");
 }
 
 bool DBConnector::hexists(const string &key, const string &field)

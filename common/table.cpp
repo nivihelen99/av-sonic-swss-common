@@ -76,8 +76,8 @@ bool Table::get(const string &key, vector<FieldValueTuple> &values)
         return false;
 
     if (reply->elements & 1)
-        throw system_error(make_error_code(errc::address_not_available),
-                           "Unable to connect netlink socket");
+        throw system_error(make_error_code(errc::protocol_error),
+                           "Malformed reply from Redis HGETALL: odd number of elements");
 
     for (unsigned int i = 0; i < reply->elements; i += 2)
     {
