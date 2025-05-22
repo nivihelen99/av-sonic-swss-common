@@ -46,6 +46,7 @@ common_libswsscommon_la_SOURCES = \
     common/ipprefix.cpp              \
     common/ipaddresses.cpp           \
     common/macaddress.cpp            \
+    common/multinotificationconsumer.cpp \
     common/netdispatcher.cpp         \
     common/netlink.cpp               \
     common/nfnetlink.cpp             \
