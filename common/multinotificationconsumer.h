@@ -5,6 +5,8 @@
 #include <vector>
 #include <queue>
 #include <deque> // Required for KeyOpFieldsValuesTuple
+#include <utility> // For std::pair
+#include <stdexcept> // For std::runtime_error
 
 #include <hiredis/hiredis.h> // Required for redisReply
 
@@ -33,6 +35,20 @@ public:
     void pop(std::string &channel, std::string &op, std::string &data, std::vector<FieldValueTuple> &values);
     void pops(std::deque<ChannelKeyOpFieldsValuesTuple> &vckco);
 
+    // Overload for backward compatibility (processes JSON, no channel output)
+    void pop(std::string &op, std::string &data, std::vector<FieldValueTuple> &values);
+
+    // Overload for backward compatibility (processes JSON, no channel output)
+    void pops(std::deque<swss::KeyOpFieldsValuesTuple> &vkco);
+
+    // Pops raw message payload string from a channel.
+    // Throws std::runtime_error if queue is empty.
+    std::string popPayload();
+
+    // Pops raw (channel_name, message_payload) pair.
+    // Throws std::runtime_error if queue is empty.
+    std::pair<std::string, std::string> popWithChannel();
+
     // Check the internal queue which fed from redis socket for data ready
     // Returns:
     //     1 - data immediately available inside internal queue, may be just fed from redis socket
@@ -42,6 +58,18 @@ public:
 
     // Unsubscribes from the specified channels.
     void unsubscribe(const std::vector<std::string>& channels_to_unsubscribe);
+
+    // Subscribes to the given Redis channel patterns.
+    void psubscribe(const std::vector<std::string>& patterns);
+
+    // Unsubscribes from the specified Redis channel patterns.
+    void punsubscribe(const std::vector<std::string>& patterns);
+
+    // Unsubscribes from all currently subscribed exact channels.
+    void unsubscribeAll();
+
+    // Unsubscribes from all currently subscribed channel patterns.
+    void punsubscribeAll();
 
     ~MultiNotificationConsumer() override;
 
@@ -61,6 +89,7 @@ private:
     swss::DBConnector *m_db; // Unused, but kept for consistency with NotificationConsumer
     swss::DBConnector *m_subscribe;
     std::vector<std::string> m_channels;
+    std::vector<std::string> m_patterns; // Stores active pattern subscriptions
     std::queue<std::pair<std::string, std::string>> m_queue; // Stores <channel_name, message_payload>
 };
 

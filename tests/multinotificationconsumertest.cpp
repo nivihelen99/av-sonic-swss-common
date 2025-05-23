@@ -458,3 +458,445 @@ TEST_F(MultiNotificationConsumerTest, UnsubscribeAllChannels) {
     ASSERT_TRUE(received_msgs.empty()) << "Received messages after unsubscribing from all channels.";
 }
 
+TEST_F(MultiNotificationConsumerTest, PopPayload) {
+    std::string channel = "PL_CH1";
+    std::string op = "SET", key = "PayloadKey";
+    std::vector<swss::FieldValueTuple> fv = {{"f1", "v1"}, {"f2", "v2"}};
+    
+    std::string expected_payload_json;
+    std::vector<swss::FieldValueTuple> fv_wrapper_json; // For JSon::writeJson
+    fv_wrapper_json.emplace_back(op, key);
+    for(const auto& pair : fv) fv_wrapper_json.push_back(pair);
+    swss::JSon::writeJson(fv_wrapper_json, expected_payload_json);
+
+    swss::MultiNotificationConsumer consumer(&m_db, {channel});
+    publishMessage(channel, op, key, fv);
+    usleep(100000); // Allow message reception
+
+    ASSERT_GT(consumer.peek(), 0) << "No data ready for PopPayload.";
+    std::string received_payload = consumer.popPayload();
+    ASSERT_EQ(received_payload, expected_payload_json);
+
+    // Queue should be empty now
+    ASSERT_LE(consumer.peek(), 0) << "Queue not empty after PopPayload.";
+
+    // Test exception on empty queue
+    EXPECT_THROW({
+        try {
+            consumer.popPayload();
+        } catch (const std::runtime_error& e) {
+            EXPECT_STREQ("Notification queue is empty, can't pop payload", e.what());
+            throw; // Re-throw to satisfy EXPECT_THROW
+        }
+    }, std::runtime_error);
+}
+
+TEST_F(MultiNotificationConsumerTest, PopWithChannel) {
+    std::string channel = "PWC_CH1";
+    std::string op = "DEL", key = "PWCKey";
+    std::vector<swss::FieldValueTuple> fv = {{"field_pwc", "value_pwc"}};
+
+    std::string expected_payload_json;
+    std::vector<swss::FieldValueTuple> fv_wrapper_json;
+    fv_wrapper_json.emplace_back(op, key);
+    for(const auto& pair : fv) fv_wrapper_json.push_back(pair);
+    swss::JSon::writeJson(fv_wrapper_json, expected_payload_json);
+
+    swss::MultiNotificationConsumer consumer(&m_db, {channel});
+    publishMessage(channel, op, key, fv);
+    usleep(100000);
+
+    ASSERT_GT(consumer.peek(), 0) << "No data ready for PopWithChannel.";
+    std::pair<std::string, std::string> result = consumer.popWithChannel();
+    
+    ASSERT_EQ(result.first, channel);
+    ASSERT_EQ(result.second, expected_payload_json);
+
+    ASSERT_LE(consumer.peek(), 0) << "Queue not empty after PopWithChannel.";
+    EXPECT_THROW({
+        try {
+            consumer.popWithChannel();
+        } catch (const std::runtime_error& e) {
+            EXPECT_STREQ("Notification queue is empty, can't pop with channel", e.what());
+            throw; // Re-throw
+        }
+    }, std::runtime_error);
+}
+
+TEST_F(MultiNotificationConsumerTest, PopOverloadBackwardCompatibility) {
+    std::string channel = "BC_POP_CH1";
+    std::string expected_op = "SET_BC", expected_key = "BC_KeyPop";
+    std::vector<swss::FieldValueTuple> expected_fv = {{"f_bc", "v_bc"}};
+
+    swss::MultiNotificationConsumer consumer(&m_db, {channel});
+    publishMessage(channel, expected_op, expected_key, expected_fv);
+    usleep(100000);
+
+    ASSERT_GT(consumer.peek(), 0) << "No data ready for backward-compatible Pop.";
+    std::string op_out, data_out;
+    std::vector<swss::FieldValueTuple> fv_out;
+    consumer.pop(op_out, data_out, fv_out); // Call the overload
+
+    ASSERT_EQ(op_out, expected_op);
+    ASSERT_EQ(data_out, expected_key);
+    ASSERT_EQ(fv_out.size(), expected_fv.size());
+    if (!expected_fv.empty()) {
+        ASSERT_EQ(fv_out[0].first, expected_fv[0].first);
+        ASSERT_EQ(fv_out[0].second, expected_fv[0].second);
+    }
+    ASSERT_LE(consumer.peek(), 0) << "Queue not empty after backward-compatible Pop.";
+}
+
+TEST_F(MultiNotificationConsumerTest, PopsOverloadBackwardCompatibility) {
+    std::vector<std::string> channels = {"BC_POPS_CH1", "BC_POPS_CH2"};
+    
+    std::string op1 = "SET_BC1", key1 = "BC_KeyPops1";
+    std::vector<swss::FieldValueTuple> fv1 = {{"f_bc1", "v_bc1"}};
+    
+    std::string op2 = "SET_BC2", key2 = "BC_KeyPops2";
+    std::vector<swss::FieldValueTuple> fv2 = {{"f_bc2", "v_bc2"}};
+
+    swss::MultiNotificationConsumer consumer(&m_db, channels);
+    publishMessage(channels[0], op1, key1, fv1);
+    publishMessage(channels[1], op2, key2, fv2);
+    usleep(100000);
+
+    ASSERT_GT(consumer.peek(), 0) << "No data ready for backward-compatible Pops.";
+    std::deque<swss::KeyOpFieldsValuesTuple> received_tuples;
+    consumer.pops(received_tuples); // Call the overload
+
+    ASSERT_EQ(received_tuples.size(), 2);
+    
+    bool found_msg1 = false;
+    bool found_msg2 = false;
+
+    for (const auto& tuple : received_tuples) {
+        std::string current_key = kfvKey(tuple); // Using common/table.h macros
+        std::string current_op = kfvOp(tuple);
+        std::vector<swss::FieldValueTuple> current_fv = kfvFieldsValues(tuple);
+
+        if (current_key == key1 && current_op == op1) {
+            found_msg1 = true;
+            ASSERT_EQ(current_fv.size(), fv1.size());
+            if (!fv1.empty()) {
+                ASSERT_EQ(current_fv[0].first, fv1[0].first);
+                ASSERT_EQ(current_fv[0].second, fv1[0].second);
+            }
+        } else if (current_key == key2 && current_op == op2) {
+            found_msg2 = true;
+            ASSERT_EQ(current_fv.size(), fv2.size());
+            if (!fv2.empty()) {
+                ASSERT_EQ(current_fv[0].first, fv2[0].first);
+                ASSERT_EQ(current_fv[0].second, fv2[0].second);
+            }
+        }
+    }
+    ASSERT_TRUE(found_msg1) << "Message 1 (key: " << key1 << ") not found in backward-compatible pops.";
+    ASSERT_TRUE(found_msg2) << "Message 2 (key: " << key2 << ") not found in backward-compatible pops.";
+    ASSERT_LE(consumer.peek(), 0) << "Queue not empty after backward-compatible Pops.";
+}
+
+TEST_F(MultiNotificationConsumerTest, PsubscribeBasic) {
+    std::vector<std::string> patterns = {"PATT_BASIC:*"};
+    std::string ch1 = "PATT_BASIC:CH1", ch2 = "PATT_BASIC:CH2";
+    std::string op1 = "SET", key1 = "KeyPBasic1";
+    std::string op2 = "DEL", key2 = "KeyPBasic2";
+    
+    swss::MultiNotificationConsumer consumer(&m_db, {}); // No exact channels initially
+    consumer.psubscribe(patterns);
+    usleep(100000); // Allow psubscribe to process
+
+    publishMessage(ch1, op1, key1, {});
+    publishMessage(ch2, op2, key2, {});
+    usleep(100000);
+
+    std::deque<swss::ChannelKeyOpFieldsValuesTuple> received_tuples;
+    ASSERT_GT(consumer.peek(), 0);
+    consumer.pops(received_tuples);
+    ASSERT_EQ(received_tuples.size(), 2);
+
+    bool found_ch1 = false, found_ch2 = false;
+    for (const auto& tuple : received_tuples) {
+        if (ckfvChannel(tuple) == ch1 && ckfvKey(tuple) == key1 && ckfvOp(tuple) == op1) found_ch1 = true;
+        if (ckfvChannel(tuple) == ch2 && ckfvKey(tuple) == key2 && ckfvOp(tuple) == op2) found_ch2 = true;
+    }
+    ASSERT_TRUE(found_ch1);
+    ASSERT_TRUE(found_ch2);
+    received_tuples.clear();
+
+    // Test with popWithChannel
+    publishMessage(ch1, op1, "KeyPBasic1_PopWC", {});
+    usleep(100000);
+    ASSERT_GT(consumer.peek(), 0);
+    auto pair_result = consumer.popWithChannel();
+    ASSERT_EQ(pair_result.first, ch1); // Verifies actual channel name
+
+    // Test with pop(channel, op, data, fv)
+    publishMessage(ch2, op2, "KeyPBasic2_PopFVT", {});
+    usleep(100000);
+    ASSERT_GT(consumer.peek(), 0);
+    std::string pop_ch, pop_op, pop_key;
+    std::vector<swss::FieldValueTuple> pop_fv;
+    consumer.pop(pop_ch, pop_op, pop_key, pop_fv);
+    ASSERT_EQ(pop_ch, ch2);
+    ASSERT_EQ(pop_op, op2);
+    ASSERT_EQ(pop_key, "KeyPBasic2_PopFVT");
+}
+
+TEST_F(MultiNotificationConsumerTest, PunsubscribeBasic) {
+    std::string pattern = "PATT_UNSUB:*";
+    std::string channel_to_pub = "PATT_UNSUB:CH1";
+    swss::MultiNotificationConsumer consumer(&m_db, {});
+    consumer.psubscribe({pattern});
+    usleep(100000);
+
+    publishMessage(channel_to_pub, "OP1", "KeyUnsub1", {});
+    usleep(100000);
+    ASSERT_GT(consumer.peek(), 0);
+    std::deque<swss::ChannelKeyOpFieldsValuesTuple> received_tuples;
+    consumer.pops(received_tuples);
+    ASSERT_EQ(received_tuples.size(), 1);
+    ASSERT_EQ(ckfvChannel(received_tuples.front()), channel_to_pub);
+    received_tuples.clear();
+
+    consumer.punsubscribe({pattern});
+    usleep(100000);
+
+    publishMessage(channel_to_pub, "OP2", "KeyUnsub2", {});
+    usleep(100000);
+    ASSERT_LE(consumer.peek(), 0); // Should not receive
+    consumer.pops(received_tuples);
+    ASSERT_TRUE(received_tuples.empty());
+}
+
+TEST_F(MultiNotificationConsumerTest, MixedSubscribeAndPsubscribe) {
+    std::string exact_ch = "EXACT_CH_MIX";
+    std::string pattern = "MIXED_PATT:*";
+    std::string patt_ch1 = "MIXED_PATT:CH1";
+    std::string patt_ch2 = "MIXED_PATT:CH2"; // Also matches exact_ch if exact_ch = "MIXED_PATT:EXACT"
+
+    // Scenario 1: Exact channel does not match pattern
+    swss::MultiNotificationConsumer consumer(&m_db, {exact_ch});
+    consumer.psubscribe({pattern});
+    usleep(100000);
+
+    publishMessage(exact_ch, "OP_EXACT", "KEY_EXACT", {});
+    publishMessage(patt_ch1, "OP_PATT1", "KEY_PATT1", {});
+    publishMessage(patt_ch2, "OP_PATT2", "KEY_PATT2", {});
+    usleep(100000);
+
+    std::deque<swss::ChannelKeyOpFieldsValuesTuple> received_tuples;
+    ASSERT_GT(consumer.peek(), 0);
+    consumer.pops(received_tuples);
+    ASSERT_EQ(received_tuples.size(), 3);
+    // Verify contents, order not guaranteed
+    bool found_exact=false, found_patt1=false, found_patt2=false;
+    for(const auto& t : received_tuples) {
+        if(ckfvChannel(t) == exact_ch && ckfvKey(t) == "KEY_EXACT") found_exact=true;
+        if(ckfvChannel(t) == patt_ch1 && ckfvKey(t) == "KEY_PATT1") found_patt1=true;
+        if(ckfvChannel(t) == patt_ch2 && ckfvKey(t) == "KEY_PATT2") found_patt2=true;
+    }
+    ASSERT_TRUE(found_exact && found_patt1 && found_patt2);
+    received_tuples.clear();
+
+    // Scenario 2: Exact channel ALSO matches pattern
+    std::string exact_ch_matches_pattern = "MIXED_PATT:EXACT";
+    swss::MultiNotificationConsumer consumer2(&m_db, {exact_ch_matches_pattern});
+    consumer2.psubscribe({pattern}); // Same pattern "MIXED_PATT:*"
+    usleep(100000);
+    
+    publishMessage(exact_ch_matches_pattern, "OP_MATCH", "KEY_MATCH", {});
+    publishMessage(patt_ch1, "OP_PATT_OTHER", "KEY_PATT_OTHER", {}); // Another pattern match
+    usleep(100000);
+
+    ASSERT_GT(consumer2.peek(), 0);
+    consumer2.pops(received_tuples);
+    // Redis should only deliver one copy of the message for exact_ch_matches_pattern
+    // Our processReply should handle this correctly.
+    ASSERT_EQ(received_tuples.size(), 2); 
+    bool found_match=false, found_patt_other=false;
+    for(const auto& t : received_tuples) {
+        if(ckfvChannel(t) == exact_ch_matches_pattern && ckfvKey(t) == "KEY_MATCH") found_match=true;
+        if(ckfvChannel(t) == patt_ch1 && ckfvKey(t) == "KEY_PATT_OTHER") found_patt_other=true;
+    }
+    ASSERT_TRUE(found_match && found_patt_other);
+}
+
+TEST_F(MultiNotificationConsumerTest, UnsubscribeAllWithPsubscriptionsActive) {
+    std::vector<std::string> exact_channels = {"EXACT_CH1_UA", "EXACT_CH2_UA"};
+    std::string pattern = "PATT_ALL_A:*";
+    std::string patt_ch3 = "PATT_ALL_A:CH3";
+    
+    swss::MultiNotificationConsumer consumer(&m_db, exact_channels);
+    consumer.psubscribe({pattern});
+    usleep(100000);
+
+    publishMessage(exact_channels[0], "OP1", "KEY1", {});
+    publishMessage(patt_ch3, "OP_PATT", "KEY_PATT", {});
+    usleep(100000);
+    std::deque<swss::ChannelKeyOpFieldsValuesTuple> deq;
+    if(consumer.peek()>0) consumer.pops(deq);
+    ASSERT_EQ(deq.size(), 2); // Exact + Pattern
+    deq.clear();
+
+    consumer.unsubscribeAll();
+    usleep(100000);
+
+    publishMessage(exact_channels[0], "OP_NEW", "KEY_NEW_EXACT", {}); // Should NOT be received
+    publishMessage(patt_ch3, "OP_NEW", "KEY_NEW_PATT3", {});       // Should BE received
+    std::string patt_ch4 = "PATT_ALL_A:CH4";
+    publishMessage(patt_ch4, "OP_NEW", "KEY_NEW_PATT4", {});       // Should BE received
+    usleep(100000);
+
+    if(consumer.peek()>0) consumer.pops(deq);
+    ASSERT_EQ(deq.size(), 2);
+    bool found_patt3=false, found_patt4=false;
+    for(const auto& t : deq) {
+        if(ckfvChannel(t) == patt_ch3) found_patt3=true;
+        if(ckfvChannel(t) == patt_ch4) found_patt4=true;
+        ASSERT_NE(ckfvChannel(t), exact_channels[0]); // Ensure no exact channel msg
+    }
+    ASSERT_TRUE(found_patt3 && found_patt4);
+}
+
+TEST_F(MultiNotificationConsumerTest, PunsubscribeAllWithSubscriptionsActive) {
+    std::string exact_ch = "EXACT_CH_B1_PUA";
+    std::vector<std::string> patterns = {"PATT_ALL_B:*", "PATT_ALL_C:*"};
+    std::string patt_b_ch = "PATT_ALL_B:CH1";
+    std::string patt_c_ch = "PATT_ALL_C:CH2";
+
+    swss::MultiNotificationConsumer consumer(&m_db, {exact_ch});
+    consumer.psubscribe(patterns);
+    usleep(100000);
+
+    publishMessage(exact_ch, "OP_EX", "KEY_EX", {});
+    publishMessage(patt_b_ch, "OP_PB", "KEY_PB", {});
+    usleep(100000);
+    std::deque<swss::ChannelKeyOpFieldsValuesTuple> deq;
+    if(consumer.peek()>0) consumer.pops(deq);
+    ASSERT_EQ(deq.size(), 2);
+    deq.clear();
+
+    consumer.punsubscribeAll();
+    usleep(100000);
+
+    publishMessage(exact_ch, "OP_EX_NEW", "KEY_EX_NEW", {});     // Should BE received
+    publishMessage(patt_b_ch, "OP_PB_NEW", "KEY_PB_NEW", {});   // Should NOT be received
+    publishMessage(patt_c_ch, "OP_PC_NEW", "KEY_PC_NEW", {});   // Should NOT be received (PATT_ALL_C was also punsubscribed)
+    usleep(100000);
+
+    if(consumer.peek()>0) consumer.pops(deq);
+    ASSERT_EQ(deq.size(), 1);
+    ASSERT_EQ(ckfvChannel(deq.front()), exact_ch);
+    ASSERT_EQ(ckfvKey(deq.front()), "KEY_EX_NEW");
+}
+
+TEST_F(MultiNotificationConsumerTest, UnsubscribeAllAndPunsubscribeAll) {
+    std::string exact_ch = "EXACT_CH_C1_UAPA";
+    std::string pattern = "PATT_ALL_D:*";
+    std::string patt_ch = "PATT_ALL_D:CH1";
+
+    swss::MultiNotificationConsumer consumer(&m_db, {exact_ch});
+    consumer.psubscribe({pattern});
+    usleep(100000);
+
+    publishMessage(exact_ch, "OP_EX", "KEY_EX", {});
+    publishMessage(patt_ch, "OP_PD", "KEY_PD", {});
+    usleep(100000);
+    std::deque<swss::ChannelKeyOpFieldsValuesTuple> deq;
+    if(consumer.peek()>0) consumer.pops(deq);
+    ASSERT_EQ(deq.size(), 2);
+    deq.clear();
+
+    consumer.unsubscribeAll();
+    consumer.punsubscribeAll();
+    usleep(100000);
+
+    publishMessage(exact_ch, "OP_EX_NEW", "KEY_EX_NEW", {});
+    publishMessage(patt_ch, "OP_PD_NEW", "KEY_PD_NEW", {});
+    usleep(100000);
+
+    ASSERT_LE(consumer.peek(), 0);
+    consumer.pops(deq);
+    ASSERT_TRUE(deq.empty());
+}
+
+TEST_F(MultiNotificationConsumerTest, UnsubscribeNonAffectingPsubscribe) {
+    std::string exact_ch = "EXACT_UNAFF";
+    std::string pattern = "PATT_UNAFF:*";
+    std::string patt_ch = "PATT_UNAFF:CH1";
+
+    swss::MultiNotificationConsumer consumer(&m_db, {exact_ch});
+    consumer.psubscribe({pattern});
+    usleep(100000);
+
+    publishMessage(exact_ch, "OP_EX", "KEY_EX", {});
+    publishMessage(patt_ch, "OP_PATT", "KEY_PATT", {});
+    usleep(100000);
+    std::deque<swss::ChannelKeyOpFieldsValuesTuple> deq;
+    if(consumer.peek()>0) consumer.pops(deq);
+    ASSERT_EQ(deq.size(), 2);
+    deq.clear();
+
+    consumer.unsubscribe({exact_ch});
+    usleep(100000);
+
+    publishMessage(exact_ch, "OP_EX_NEW", "KEY_EX_NEW", {});     // Should NOT be received
+    publishMessage(patt_ch, "OP_PATT_NEW", "KEY_PATT_NEW", {}); // Should BE received
+    usleep(100000);
+
+    if(consumer.peek()>0) consumer.pops(deq);
+    ASSERT_EQ(deq.size(), 1);
+    ASSERT_EQ(ckfvChannel(deq.front()), patt_ch);
+    ASSERT_EQ(ckfvKey(deq.front()), "KEY_PATT_NEW");
+}
+
+TEST_F(MultiNotificationConsumerTest, PunsubscribeNonAffectingSubscribe) {
+    std::string exact_ch = "EXACT_UNAFF2";
+    std::string pattern = "PATT_UNAFF2:*";
+    std::string patt_ch = "PATT_UNAFF2:CH1";
+
+    swss::MultiNotificationConsumer consumer(&m_db, {exact_ch});
+    consumer.psubscribe({pattern});
+    usleep(100000);
+
+    publishMessage(exact_ch, "OP_EX", "KEY_EX", {});
+    publishMessage(patt_ch, "OP_PATT", "KEY_PATT", {});
+    usleep(100000);
+    std::deque<swss::ChannelKeyOpFieldsValuesTuple> deq;
+    if(consumer.peek()>0) consumer.pops(deq);
+    ASSERT_EQ(deq.size(), 2);
+    deq.clear();
+
+    consumer.punsubscribe({pattern});
+    usleep(100000);
+
+    publishMessage(exact_ch, "OP_EX_NEW", "KEY_EX_NEW", {});     // Should BE received
+    publishMessage(patt_ch, "OP_PATT_NEW", "KEY_PATT_NEW", {}); // Should NOT be received
+    usleep(100000);
+
+    if(consumer.peek()>0) consumer.pops(deq);
+    ASSERT_EQ(deq.size(), 1);
+    ASSERT_EQ(ckfvChannel(deq.front()), exact_ch);
+    ASSERT_EQ(ckfvKey(deq.front()), "KEY_EX_NEW");
+}
+
+TEST_F(MultiNotificationConsumerTest, UnsubscribeAllNoOp) {
+    swss::MultiNotificationConsumer consumer(&m_db, {}); // No initial subscriptions
+    ASSERT_NO_THROW(consumer.unsubscribeAll()); // Should be a graceful no-op
+    usleep(50000); // Short delay
+    // Verify no internal state change that might cause issues
+    publishMessage("ANY_CH_UA", "OP", "KEY", {});
+    usleep(50000);
+    ASSERT_LE(consumer.peek(), 0);
+}
+
+TEST_F(MultiNotificationConsumerTest, PunsubscribeAllNoOp) {
+    swss::MultiNotificationConsumer consumer(&m_db, {}); // No initial psubscriptions
+    ASSERT_NO_THROW(consumer.punsubscribeAll()); // Should be a graceful no-op
+    usleep(50000);
+    publishMessage("ANY_CH_PUA", "OP", "KEY", {});
+    usleep(50000);
+    ASSERT_LE(consumer.peek(), 0);
+}
+
