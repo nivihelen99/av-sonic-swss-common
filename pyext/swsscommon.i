@@ -56,6 +56,7 @@
 #include "zmqclient.h"
 #include "zmqconsumerstatetable.h"
 #include "zmqproducerstatetable.h"
+#include "stream.h" // Added for Stream class
 #include <memory>
 #include <functional>
 #include "interface.h"
@@ -85,7 +86,25 @@
 %template(KeyOpFieldsValuesQueue) std::deque<std::tuple<std::string, std::string, std::vector<std::pair<std::string, std::string>>>>;
 %template(VectorSonicDbKey) std::vector<swss::SonicDBKey>;
 
+// Templates for Redis Streams data structures
+// FieldValuePairs is std::vector<std::pair<std::string, std::string>> - already defined
+
+// A single message: std::pair<std::string (ID), std::string (concatenated fields)>
+// This is what DBConnector's C++ methods return inside the more complex structure.
+// So, Stream class methods also return this structure.
+%template(StreamMessageTuple) std::pair<std::string, std::string>;
+// A vector of messages for a single stream: std::vector<StreamMessageTuple>
+%template(StreamMessageList) std::vector<swss::StreamMessageTuple>;
+// A pair representing (stream_name, list_of_messages_for_that_stream)
+// std::pair<std::string, std::vector<std::pair<std::string, std::string>>>
+%template(StreamMessagesEntry) std::pair<std::string, swss::StreamMessageList>;
+// The full result for xread/xreadgroup: std::vector<StreamMessagesEntry>
+%template(StreamReadResultVec) std::vector<swss::StreamMessagesEntry>;
+
 #ifdef SWIGPYTHON
+%shared_ptr(swss::StreamReadResultVec, StreamReadResult); // Wraps std::shared_ptr<std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>>
+%shared_ptr(swss::RedisReply); // For Stream::xpending return type
+
 %exception {
     try
     {
@@ -355,7 +374,20 @@ T castSelectableObj(swss::Selectable *temp)
 %include "dbinterface.h"
 %include "logger.h"
 %include "events.h"
+%include "stream.h" // Include Stream class header
 
 %include "status_code_util.h"
 #include "redis_table_waiter.h"
 %include "restart_waiter.h"
+
+// Expose the Stream class
+%include "stream.h"
+%extend swss::Stream {
+    // Potentially add Python-specific helpers here if needed, e.g. for parsing concatenated fields
+    // For now, rely on the direct method wrapping.
+    // The complex return types are handled by the %shared_ptr and %template directives above.
+}
+
+// Ensure RedisReply methods needed by Python are exposed if not already
+// (e.g., to parse the reply from xpending)
+// RedisReply seems to be included already.

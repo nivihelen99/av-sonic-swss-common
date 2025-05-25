@@ -1053,3 +1053,701 @@ map<string, map<string, map<string, string>>> DBConnector::getall()
     }
     return data;
 }
+
+// Redis Streams commands implementation
+
+std::string DBConnector::xadd(const std::string &key, const std::string &id, const std::vector<std::pair<std::string, std::string>> &values, int maxlen, bool approximate)
+{
+    RedisCommand cmd;
+    std::vector<const char *> argv;
+    std::vector<size_t> argvlen;
+
+    argv.push_back("XADD");
+    argvlen.push_back(4);
+
+    argv.push_back(key.c_str());
+    argvlen.push_back(key.length());
+
+    if (maxlen > 0)
+    {
+        argv.push_back("MAXLEN");
+        argvlen.push_back(6);
+        if (approximate)
+        {
+            argv.push_back("~");
+            argvlen.push_back(1);
+        }
+        std::string maxlen_str = std::to_string(maxlen);
+        argv.push_back(maxlen_str.c_str());
+        argvlen.push_back(maxlen_str.length());
+    }
+
+    argv.push_back(id.c_str());
+    argvlen.push_back(id.length());
+
+    for (const auto &field_value_pair : values)
+    {
+        argv.push_back(field_value_pair.first.c_str());
+        argvlen.push_back(field_value_pair.first.length());
+        argv.push_back(field_value_pair.second.c_str());
+        argvlen.push_back(field_value_pair.second.length());
+    }
+
+    cmd.formatArgv(argv.size(), argv.data(), argvlen.data());
+    RedisReply r(this, cmd, REDIS_REPLY_STRING);
+    return r.getReply<std::string>();
+}
+
+std::shared_ptr<std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>> DBConnector::xread(const std::vector<std::string> &keys, const std::vector<std::string> &ids, int count, int block_ms)
+{
+    RedisCommand cmd;
+    std::vector<const char *> argv;
+    std::vector<size_t> argvlen;
+
+    argv.push_back("XREAD");
+    argvlen.push_back(5);
+
+    if (count != -1)
+    {
+        argv.push_back("COUNT");
+        argvlen.push_back(5);
+        std::string count_str = std::to_string(count);
+        argv.push_back(count_str.c_str());
+        argvlen.push_back(count_str.length());
+    }
+
+    if (block_ms != -1)
+    {
+        argv.push_back("BLOCK");
+        argvlen.push_back(5);
+        std::string block_str = std::to_string(block_ms);
+        argv.push_back(block_str.c_str());
+        argvlen.push_back(block_str.length());
+    }
+
+    argv.push_back("STREAMS");
+    argvlen.push_back(7);
+
+    for (const auto &key : keys)
+    {
+        argv.push_back(key.c_str());
+        argvlen.push_back(key.length());
+    }
+    for (const auto &id : ids)
+    {
+        argv.push_back(id.c_str());
+        argvlen.push_back(id.length());
+    }
+
+    cmd.formatArgv(argv.size(), argv.data(), argvlen.data());
+    RedisReply r(this, cmd);
+
+    if (r.getContext()->type == REDIS_REPLY_NIL)
+    {
+        return nullptr;
+    }
+    r.checkReplyType(REDIS_REPLY_ARRAY);
+
+    auto result = std::make_shared<std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>>();
+    for (size_t i = 0; i < r.getContext()->elements; ++i)
+    {
+        RedisReply stream_reply(r.releaseChild(i));
+        stream_reply.checkReplyType(REDIS_REPLY_ARRAY);
+        if (stream_reply.getContext()->elements != 2)
+        {
+            throw std::runtime_error("XREAD: Stream reply should have 2 elements");
+        }
+
+        RedisReply stream_name_reply(stream_reply.releaseChild(0));
+        stream_name_reply.checkReplyType(REDIS_REPLY_STRING);
+        std::string stream_name = stream_name_reply.getReply<std::string>();
+
+        RedisReply messages_reply(stream_reply.releaseChild(1));
+        messages_reply.checkReplyType(REDIS_REPLY_ARRAY);
+
+        std::vector<std::pair<std::string, std::string>> messages;
+        for (size_t j = 0; j < messages_reply.getContext()->elements; ++j)
+        {
+            RedisReply message_reply(messages_reply.releaseChild(j));
+            message_reply.checkReplyType(REDIS_REPLY_ARRAY);
+            if (message_reply.getContext()->elements != 2)
+            {
+                throw std::runtime_error("XREAD: Message reply should have 2 elements");
+            }
+
+            RedisReply message_id_reply(message_reply.releaseChild(0));
+            message_id_reply.checkReplyType(REDIS_REPLY_STRING);
+            std::string message_id = message_id_reply.getReply<std::string>();
+
+            RedisReply fields_reply(message_reply.releaseChild(1));
+            fields_reply.checkReplyType(REDIS_REPLY_ARRAY);
+            if (fields_reply.getContext()->elements % 2 != 0)
+            {
+                throw std::runtime_error("XREAD: Fields reply should have an even number of elements");
+            }
+
+            messages.emplace_back(message_id, ""); // Placeholder for combined fields
+            std::string& combined_fields = messages.back().second;
+
+            for (size_t k = 0; k < fields_reply.getContext()->elements; k += 2)
+            {
+                RedisReply field_name_reply(fields_reply.releaseChild(k));
+                field_name_reply.checkReplyType(REDIS_REPLY_STRING);
+                std::string field_name = field_name_reply.getReply<std::string>();
+
+                RedisReply field_value_reply(fields_reply.releaseChild(k + 1));
+                field_value_reply.checkReplyType(REDIS_REPLY_STRING);
+                std::string field_value = field_value_reply.getReply<std::string>();
+                if (!combined_fields.empty()) {
+                    combined_fields += ",";
+                }
+                combined_fields += field_name + ":" + field_value;
+            }
+        }
+        result->emplace_back(stream_name, messages);
+    }
+    return result;
+}
+
+bool DBConnector::xgroup_create(const std::string &key, const std::string &groupname, const std::string &id, bool mkstream)
+{
+    RedisCommand cmd;
+    std::vector<const char *> argv;
+    std::vector<size_t> argvlen;
+
+    argv.push_back("XGROUP");
+    argvlen.push_back(6);
+    argv.push_back("CREATE");
+    argvlen.push_back(6);
+    argv.push_back(key.c_str());
+    argvlen.push_back(key.length());
+    argv.push_back(groupname.c_str());
+    argvlen.push_back(groupname.length());
+    argv.push_back(id.c_str());
+    argvlen.push_back(id.length());
+    if (mkstream)
+    {
+        argv.push_back("MKSTREAM");
+        argvlen.push_back(8);
+    }
+
+    cmd.formatArgv(argv.size(), argv.data(), argvlen.data());
+    RedisReply r(this, cmd, REDIS_REPLY_STATUS);
+    return r.getReply<std::string>() == "OK";
+}
+
+bool DBConnector::xgroup_destroy(const std::string &key, const std::string &groupname)
+{
+    RedisCommand cmd;
+    cmd.format("XGROUP DESTROY %s %s", key.c_str(), groupname.c_str());
+    RedisReply r(this, cmd, REDIS_REPLY_INTEGER); // Returns 1 if successful, 0 otherwise (e.g. group does not exist)
+    return r.getContext()->integer == 1;
+}
+
+int64_t DBConnector::xgroup_delconsumer(const std::string &key, const std::string &groupname, const std::string &consumername)
+{
+    RedisCommand cmd;
+    cmd.format("XGROUP DELCONSUMER %s %s %s", key.c_str(), groupname.c_str(), consumername.c_str());
+    RedisReply r(this, cmd, REDIS_REPLY_INTEGER);
+    return r.getContext()->integer;
+}
+
+std::shared_ptr<std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>> DBConnector::xreadgroup(const std::string &groupname, const std::string &consumername, const std::vector<std::string> &keys, const std::vector<std::string> &ids, int count, bool noack, int block_ms)
+{
+    RedisCommand cmd;
+    std::vector<const char *> argv;
+    std::vector<size_t> argvlen;
+
+    argv.push_back("XREADGROUP");
+    argvlen.push_back(10);
+    argv.push_back("GROUP");
+    argvlen.push_back(5);
+    argv.push_back(groupname.c_str());
+    argvlen.push_back(groupname.length());
+    argv.push_back(consumername.c_str());
+    argvlen.push_back(consumername.length());
+
+    if (count != -1)
+    {
+        argv.push_back("COUNT");
+        argvlen.push_back(5);
+        std::string count_str = std::to_string(count);
+        argv.push_back(count_str.c_str());
+        argvlen.push_back(count_str.length());
+    }
+
+    if (block_ms != -1)
+    {
+        argv.push_back("BLOCK");
+        argvlen.push_back(5);
+        std::string block_str = std::to_string(block_ms);
+        argv.push_back(block_str.c_str());
+        argvlen.push_back(block_str.length());
+    }
+
+    if (noack)
+    {
+        argv.push_back("NOACK");
+        argvlen.push_back(5);
+    }
+
+    argv.push_back("STREAMS");
+    argvlen.push_back(7);
+
+    for (const auto &key : keys)
+    {
+        argv.push_back(key.c_str());
+        argvlen.push_back(key.length());
+    }
+    for (const auto &id : ids)
+    {
+        argv.push_back(id.c_str());
+        argvlen.push_back(id.length());
+    }
+
+    cmd.formatArgv(argv.size(), argv.data(), argvlen.data());
+    RedisReply r(this, cmd);
+
+    if (r.getContext()->type == REDIS_REPLY_NIL)
+    {
+        return nullptr;
+    }
+    r.checkReplyType(REDIS_REPLY_ARRAY);
+    
+    auto result = std::make_shared<std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>>();
+    for (size_t i = 0; i < r.getContext()->elements; ++i)
+    {
+        RedisReply stream_reply(r.releaseChild(i));
+        stream_reply.checkReplyType(REDIS_REPLY_ARRAY);
+        if (stream_reply.getContext()->elements != 2)
+        {
+            throw std::runtime_error("XREADGROUP: Stream reply should have 2 elements");
+        }
+
+        RedisReply stream_name_reply(stream_reply.releaseChild(0));
+        stream_name_reply.checkReplyType(REDIS_REPLY_STRING);
+        std::string stream_name = stream_name_reply.getReply<std::string>();
+
+        RedisReply messages_reply(stream_reply.releaseChild(1));
+        messages_reply.checkReplyType(REDIS_REPLY_ARRAY);
+
+        std::vector<std::pair<std::string, std::string>> messages;
+        for (size_t j = 0; j < messages_reply.getContext()->elements; ++j)
+        {
+            RedisReply message_reply(messages_reply.releaseChild(j));
+            message_reply.checkReplyType(REDIS_REPLY_ARRAY);
+            if (message_reply.getContext()->elements != 2)
+            {
+                throw std::runtime_error("XREADGROUP: Message reply should have 2 elements");
+            }
+
+            RedisReply message_id_reply(message_reply.releaseChild(0));
+            message_id_reply.checkReplyType(REDIS_REPLY_STRING);
+            std::string message_id = message_id_reply.getReply<std::string>();
+
+            RedisReply fields_reply(message_reply.releaseChild(1));
+            fields_reply.checkReplyType(REDIS_REPLY_ARRAY);
+            if (fields_reply.getContext()->elements % 2 != 0)
+            {
+                throw std::runtime_error("XREADGROUP: Fields reply should have an even number of elements");
+            }
+            
+            messages.emplace_back(message_id, ""); // Placeholder for combined fields
+            std::string& combined_fields = messages.back().second;
+
+            for (size_t k = 0; k < fields_reply.getContext()->elements; k += 2)
+            {
+                RedisReply field_name_reply(fields_reply.releaseChild(k));
+                field_name_reply.checkReplyType(REDIS_REPLY_STRING);
+                std::string field_name = field_name_reply.getReply<std::string>();
+
+                RedisReply field_value_reply(fields_reply.releaseChild(k + 1));
+                field_value_reply.checkReplyType(REDIS_REPLY_STRING);
+                std::string field_value = field_value_reply.getReply<std::string>();
+                if (!combined_fields.empty()) {
+                    combined_fields += ",";
+                }
+                combined_fields += field_name + ":" + field_value;
+            }
+        }
+        result->emplace_back(stream_name, messages);
+    }
+    return result;
+}
+
+int64_t DBConnector::xack(const std::string &key, const std::string &groupname, const std::vector<std::string> &ids)
+{
+    if (ids.empty()) {
+        return 0;
+    }
+    RedisCommand cmd;
+    std::vector<const char *> argv;
+    std::vector<size_t> argvlen;
+
+    argv.push_back("XACK");
+    argvlen.push_back(4);
+    argv.push_back(key.c_str());
+    argvlen.push_back(key.length());
+    argv.push_back(groupname.c_str());
+    argvlen.push_back(groupname.length());
+
+    for (const auto &id : ids)
+    {
+        argv.push_back(id.c_str());
+        argvlen.push_back(id.length());
+    }
+
+    cmd.formatArgv(argv.size(), argv.data(), argvlen.data());
+    RedisReply r(this, cmd, REDIS_REPLY_INTEGER);
+    return r.getContext()->integer;
+}
+
+std::shared_ptr<RedisReply> DBConnector::xpending(const std::string &key, const std::string &groupname, const std::string &start, const std::string &end, int count, const std::string &consumername)
+{
+    RedisCommand cmd;
+    std::vector<const char *> argv;
+    std::vector<size_t> argvlen;
+
+    argv.push_back("XPENDING");
+    argvlen.push_back(8);
+    argv.push_back(key.c_str());
+    argvlen.push_back(key.length());
+    argv.push_back(groupname.c_str());
+    argvlen.push_back(groupname.length());
+
+    if (!consumername.empty() || start != "-" || end != "+" || count != -1) // Detailed version
+    {
+        argv.push_back(start.c_str());
+        argvlen.push_back(start.length());
+        argv.push_back(end.c_str());
+        argvlen.push_back(end.length());
+        std::string count_str = std::to_string(count);
+        argv.push_back(count_str.c_str());
+        argvlen.push_back(count_str.length());
+        if (!consumername.empty())
+        {
+            argv.push_back(consumername.c_str());
+            argvlen.push_back(consumername.length());
+        }
+    }
+    
+    cmd.formatArgv(argv.size(), argv.data(), argvlen.data());
+    // XPENDING can return different types of replies.
+    // Simple form (key, group): array of 4 elements: pending_count, min_id, max_id, array_of_consumers_with_pending_messages
+    // Detailed form (key, group, start, end, count, [consumer]): array of arrays (message_id, consumer, idle_time, delivery_count)
+    return std::make_shared<RedisReply>(this, cmd);
+}
+
+std::shared_ptr<std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>> DBConnector::xclaim(const std::string &key, const std::string &groupname, const std::string &consumername, int min_idle_time, const std::vector<std::string> &ids, bool justid)
+{
+    if (ids.empty()) {
+        return std::make_shared<std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>>();
+    }
+    RedisCommand cmd;
+    std::vector<const char *> argv;
+    std::vector<size_t> argvlen;
+
+    argv.push_back("XCLAIM");
+    argvlen.push_back(6);
+    argv.push_back(key.c_str());
+    argvlen.push_back(key.length());
+    argv.push_back(groupname.c_str());
+    argvlen.push_back(groupname.length());
+    argv.push_back(consumername.c_str());
+    argvlen.push_back(consumername.length());
+    std::string min_idle_time_str = std::to_string(min_idle_time);
+    argv.push_back(min_idle_time_str.c_str());
+    argvlen.push_back(min_idle_time_str.length());
+
+    for (const auto &id : ids)
+    {
+        argv.push_back(id.c_str());
+        argvlen.push_back(id.length());
+    }
+
+    if (justid)
+    {
+        argv.push_back("JUSTID");
+        argvlen.push_back(6);
+    }
+
+    cmd.formatArgv(argv.size(), argv.data(), argvlen.data());
+    RedisReply r(this, cmd, REDIS_REPLY_ARRAY);
+
+    auto result = std::make_shared<std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>>();
+    // The reply is an array of messages (stream entries). 
+    // Each message is itself an array composed of the ID and the list of field-value pairs.
+    // If JUSTID is used, the reply is just an array of IDs.
+    if (justid) {
+        std::vector<std::pair<std::string, std::string>> messages;
+        for (size_t i = 0; i < r.getContext()->elements; ++i) {
+            RedisReply id_reply(r.releaseChild(i));
+            id_reply.checkReplyType(REDIS_REPLY_STRING);
+            messages.emplace_back(id_reply.getReply<std::string>(), ""); // No fields if JUSTID
+        }
+        if (!messages.empty()) {
+             // For JUSTID, there's no stream name in the direct reply, so we use the input key.
+            result->emplace_back(key, messages);
+        }
+    } else {
+        // This parsing is similar to XREAD/XREADGROUP
+        // However, XCLAIM's direct reply is an array of messages, not an array of streams.
+        // So we treat the whole reply as a single "stream" for parsing purposes, using the input key.
+        std::vector<std::pair<std::string, std::string>> messages;
+        for (size_t j = 0; j < r.getContext()->elements; ++j)
+        {
+            RedisReply message_reply(r.releaseChild(j));
+            message_reply.checkReplyType(REDIS_REPLY_ARRAY);
+            if (message_reply.getContext()->elements != 2)
+            {
+                throw std::runtime_error("XCLAIM: Message reply should have 2 elements");
+            }
+
+            RedisReply message_id_reply(message_reply.releaseChild(0));
+            message_id_reply.checkReplyType(REDIS_REPLY_STRING);
+            std::string message_id = message_id_reply.getReply<std::string>();
+
+            RedisReply fields_reply(message_reply.releaseChild(1));
+            fields_reply.checkReplyType(REDIS_REPLY_ARRAY);
+            if (fields_reply.getContext()->elements % 2 != 0)
+            {
+                throw std::runtime_error("XCLAIM: Fields reply should have an even number of elements");
+            }
+            
+            messages.emplace_back(message_id, ""); // Placeholder for combined fields
+            std::string& combined_fields = messages.back().second;
+
+            for (size_t k = 0; k < fields_reply.getContext()->elements; k += 2)
+            {
+                RedisReply field_name_reply(fields_reply.releaseChild(k));
+                field_name_reply.checkReplyType(REDIS_REPLY_STRING);
+                std::string field_name = field_name_reply.getReply<std::string>();
+
+                RedisReply field_value_reply(fields_reply.releaseChild(k + 1));
+                field_value_reply.checkReplyType(REDIS_REPLY_STRING);
+                std::string field_value = field_value_reply.getReply<std::string>();
+                if (!combined_fields.empty()) {
+                    combined_fields += ",";
+                }
+                combined_fields += field_name + ":" + field_value;
+            }
+        }
+        if (!messages.empty()) {
+            result->emplace_back(key, messages);
+        }
+    }
+    return result;
+}
+
+int64_t DBConnector::xlen(const std::string &key)
+{
+    RedisCommand cmd;
+    cmd.format("XLEN %s", key.c_str());
+    RedisReply r(this, cmd, REDIS_REPLY_INTEGER);
+    return r.getContext()->integer;
+}
+
+int64_t DBConnector::xtrim(const std::string &key, const std::string &strategy, const std::string &threshold, bool approximate, int limit)
+{
+    RedisCommand cmd;
+    std::vector<const char *> argv;
+    std::vector<size_t> argvlen;
+
+    argv.push_back("XTRIM");
+    argvlen.push_back(5);
+    argv.push_back(key.c_str());
+    argvlen.push_back(key.length());
+    argv.push_back(strategy.c_str()); // MAXLEN or MINID
+    argvlen.push_back(strategy.length());
+    if (approximate)
+    {
+        argv.push_back("~");
+        argvlen.push_back(1);
+    }
+    argv.push_back(threshold.c_str());
+    argvlen.push_back(threshold.length());
+
+    if (limit > 0) {
+        argv.push_back("LIMIT");
+        argvlen.push_back(5);
+        std::string limit_str = std::to_string(limit);
+        argv.push_back(limit_str.c_str());
+        argvlen.push_back(limit_str.length());
+    }
+    
+    cmd.formatArgv(argv.size(), argv.data(), argvlen.data());
+    RedisReply r(this, cmd, REDIS_REPLY_INTEGER);
+    return r.getContext()->integer;
+}
+
+std::shared_ptr<std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>> DBConnector::xrange(const std::string &key, const std::string &start, const std::string &end, int count)
+{
+    RedisCommand cmd;
+    std::vector<const char *> argv;
+    std::vector<size_t> argvlen;
+
+    argv.push_back("XRANGE");
+    argvlen.push_back(6);
+    argv.push_back(key.c_str());
+    argvlen.push_back(key.length());
+    argv.push_back(start.c_str());
+    argvlen.push_back(start.length());
+    argv.push_back(end.c_str());
+    argvlen.push_back(end.length());
+
+    if (count != -1)
+    {
+        argv.push_back("COUNT");
+        argvlen.push_back(5);
+        std::string count_str = std::to_string(count);
+        argv.push_back(count_str.c_str());
+        argvlen.push_back(count_str.length());
+    }
+
+    cmd.formatArgv(argv.size(), argv.data(), argvlen.data());
+    RedisReply r(this, cmd, REDIS_REPLY_ARRAY);
+
+    auto result = std::make_shared<std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>>();
+    std::vector<std::pair<std::string, std::string>> messages;
+    for (size_t j = 0; j < r.getContext()->elements; ++j)
+    {
+        RedisReply message_reply(r.releaseChild(j));
+        message_reply.checkReplyType(REDIS_REPLY_ARRAY);
+        if (message_reply.getContext()->elements != 2)
+        {
+            throw std::runtime_error("XRANGE: Message reply should have 2 elements");
+        }
+
+        RedisReply message_id_reply(message_reply.releaseChild(0));
+        message_id_reply.checkReplyType(REDIS_REPLY_STRING);
+        std::string message_id = message_id_reply.getReply<std::string>();
+
+        RedisReply fields_reply(message_reply.releaseChild(1));
+        fields_reply.checkReplyType(REDIS_REPLY_ARRAY);
+        if (fields_reply.getContext()->elements % 2 != 0)
+        {
+            throw std::runtime_error("XRANGE: Fields reply should have an even number of elements");
+        }
+        
+        messages.emplace_back(message_id, ""); // Placeholder for combined fields
+        std::string& combined_fields = messages.back().second;
+
+        for (size_t k = 0; k < fields_reply.getContext()->elements; k += 2)
+        {
+            RedisReply field_name_reply(fields_reply.releaseChild(k));
+            field_name_reply.checkReplyType(REDIS_REPLY_STRING);
+            std::string field_name = field_name_reply.getReply<std::string>();
+
+            RedisReply field_value_reply(fields_reply.releaseChild(k + 1));
+            field_value_reply.checkReplyType(REDIS_REPLY_STRING);
+            std::string field_value = field_value_reply.getReply<std::string>();
+            if (!combined_fields.empty()) {
+                combined_fields += ",";
+            }
+            combined_fields += field_name + ":" + field_value;
+        }
+    }
+    if (!messages.empty()) {
+        result->emplace_back(key, messages);
+    }
+    return result;
+}
+
+std::shared_ptr<std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>> DBConnector::xrevrange(const std::string &key, const std::string &end, const std::string &start, int count)
+{
+    RedisCommand cmd;
+    std::vector<const char *> argv;
+    std::vector<size_t> argvlen;
+
+    argv.push_back("XREVRANGE");
+    argvlen.push_back(9);
+    argv.push_back(key.c_str());
+    argvlen.push_back(key.length());
+    argv.push_back(end.c_str()); // Note: end and start are swapped for XREVRANGE
+    argvlen.push_back(end.length());
+    argv.push_back(start.c_str());
+    argvlen.push_back(start.length());
+
+    if (count != -1)
+    {
+        argv.push_back("COUNT");
+        argvlen.push_back(5);
+        std::string count_str = std::to_string(count);
+        argv.push_back(count_str.c_str());
+        argvlen.push_back(count_str.length());
+    }
+
+    cmd.formatArgv(argv.size(), argv.data(), argvlen.data());
+    RedisReply r(this, cmd, REDIS_REPLY_ARRAY);
+    
+    auto result = std::make_shared<std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>>();
+    std::vector<std::pair<std::string, std::string>> messages;
+     for (size_t j = 0; j < r.getContext()->elements; ++j)
+    {
+        RedisReply message_reply(r.releaseChild(j));
+        message_reply.checkReplyType(REDIS_REPLY_ARRAY);
+        if (message_reply.getContext()->elements != 2)
+        {
+            throw std::runtime_error("XREVRANGE: Message reply should have 2 elements");
+        }
+
+        RedisReply message_id_reply(message_reply.releaseChild(0));
+        message_id_reply.checkReplyType(REDIS_REPLY_STRING);
+        std::string message_id = message_id_reply.getReply<std::string>();
+
+        RedisReply fields_reply(message_reply.releaseChild(1));
+        fields_reply.checkReplyType(REDIS_REPLY_ARRAY);
+        if (fields_reply.getContext()->elements % 2 != 0)
+        {
+            throw std::runtime_error("XREVRANGE: Fields reply should have an even number of elements");
+        }
+        
+        messages.emplace_back(message_id, ""); // Placeholder for combined fields
+        std::string& combined_fields = messages.back().second;
+
+        for (size_t k = 0; k < fields_reply.getContext()->elements; k += 2)
+        {
+            RedisReply field_name_reply(fields_reply.releaseChild(k));
+            field_name_reply.checkReplyType(REDIS_REPLY_STRING);
+            std::string field_name = field_name_reply.getReply<std::string>();
+
+            RedisReply field_value_reply(fields_reply.releaseChild(k + 1));
+            field_value_reply.checkReplyType(REDIS_REPLY_STRING);
+            std::string field_value = field_value_reply.getReply<std::string>();
+            if (!combined_fields.empty()) {
+                combined_fields += ",";
+            }
+            combined_fields += field_name + ":" + field_value;
+        }
+    }
+    if (!messages.empty()) {
+        result->emplace_back(key, messages);
+    }
+    return result;
+}
+
+int64_t DBConnector::xdel(const std::string &key, const std::vector<std::string> &ids)
+{
+    if (ids.empty()) {
+        return 0;
+    }
+    RedisCommand cmd;
+    std::vector<const char *> argv;
+    std::vector<size_t> argvlen;
+
+    argv.push_back("XDEL");
+    argvlen.push_back(4);
+    argv.push_back(key.c_str());
+    argvlen.push_back(key.length());
+
+    for (const auto &id : ids)
+    {
+        argv.push_back(id.c_str());
+        argvlen.push_back(id.length());
+    }
+
+    cmd.formatArgv(argv.size(), argv.data(), argvlen.data());
+    RedisReply r(this, cmd, REDIS_REPLY_INTEGER);
+    return r.getContext()->integer;
+}
+

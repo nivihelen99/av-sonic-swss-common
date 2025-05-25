@@ -311,6 +311,23 @@ public:
     bool flushdb();
 
     std::map<std::string, std::map<std::string, std::map<std::string, std::string>>> getall();
+
+    // Redis Streams commands
+    std::string xadd(const std::string &key, const std::string &id, const std::vector<std::pair<std::string, std::string>> &values, int maxlen = 0, bool approximate = false);
+    std::shared_ptr<std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>> xread(const std::vector<std::string> &keys, const std::vector<std::string> &ids, int count = -1, int block_ms = -1);
+    bool xgroup_create(const std::string &key, const std::string &groupname, const std::string &id = "$", bool mkstream = false);
+    bool xgroup_destroy(const std::string &key, const std::string &groupname);
+    int64_t xgroup_delconsumer(const std::string &key, const std::string &groupname, const std::string &consumername);
+    std::shared_ptr<std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>> xreadgroup(const std::string &groupname, const std::string &consumername, const std::vector<std::string> &keys, const std::vector<std::string> &ids, int count = -1, bool noack = false, int block_ms = -1);
+    int64_t xack(const std::string &key, const std::string &groupname, const std::vector<std::string> &ids);
+    std::shared_ptr<RedisReply> xpending(const std::string &key, const std::string &groupname, const std::string &start = "-", const std::string &end = "+", int count = -1, const std::string &consumername = "");
+    std::shared_ptr<std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>> xclaim(const std::string &key, const std::string &groupname, const std::string &consumername, int min_idle_time, const std::vector<std::string> &ids, bool justid = false);
+    int64_t xlen(const std::string &key);
+    int64_t xtrim(const std::string &key, const std::string &strategy, const std::string &threshold, bool approximate = false, int limit = 0);
+    std::shared_ptr<std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>> xrange(const std::string &key, const std::string &start, const std::string &end, int count = -1);
+    std::shared_ptr<std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>> xrevrange(const std::string &key, const std::string &end, const std::string &start, int count = -1);
+    int64_t xdel(const std::string &key, const std::vector<std::string> &ids);
+
 private:
     void setNamespace(const std::string &netns);
     void setDBKey(const SonicDBKey &key);

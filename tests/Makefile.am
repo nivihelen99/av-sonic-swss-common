@@ -46,10 +46,24 @@ tests_tests_SOURCES = tests/redis_ut.cpp                \
                       tests/performancetimer_ut.cpp     \
                       tests/main.cpp
 
+# Common test program including most unit tests
 tests_tests_CFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(CFLAGS_GTEST) $(LIBNL_CFLAGS)
 tests_tests_CPPFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(CFLAGS_GTEST) $(LIBNL_CFLAGS) -fno-access-control
 tests_tests_LDADD = $(LDADD_GTEST) -lpthread common/libswsscommon.la $(LIBNL_LIBS) $(CODE_COVERAGE_LIBS) sonic-db-cli/libsonicdbcli.la -lzmq -luuid -lboost_serialization
 
+# Redis Stream unit tests program
+bin_PROGRAMS += tests/redis_stream_ut
+tests_redis_stream_ut_SOURCES = tests/redis_stream_ut.cpp
+tests_redis_stream_ut_CFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(CFLAGS_GTEST)
+tests_redis_stream_ut_CPPFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(CFLAGS_GTEST) -fno-access-control
+tests_redis_stream_ut_LDADD = $(LDADD_GTEST) -lpthread common/libswsscommon.la $(CODE_COVERAGE_LIBS) -hiredis
+# Note: Added -lhiredis directly as it's a primary dependency for stream operations.
+# If other specific libs from libswsscommon.la's dependencies are needed, they might need to be listed.
+
 if YANGMODS
 tests_tests_SOURCES += tests/defaultvalueprovider_ut.cpp
 endif
+
+# Add Python stream test to EXTRA_DIST and DISTCLEANFILES
+EXTRA_DIST += tests/test_stream.py
+DISTCLEANFILES += tests/test_stream.py
