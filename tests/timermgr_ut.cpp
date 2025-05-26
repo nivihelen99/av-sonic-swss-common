@@ -139,45 +139,71 @@ protected:
         return baseIntervalToMs(current_base_interval_);
     }
     
-    // Helper to yield for a short period, allowing timer thread to catch up.
-    // Prefer condition variables, but this can be a fallback or for specific timing tests.
-    void yield(std::chrono::milliseconds duration = 1ms) {
-        std::this_thread::sleep_for(duration);
+    // Removed old yield method
+
+    // Helper to call processTick multiple times and check conditions
+    // Returns true if expected_executions_after (if specified >=0) is met.
+    // If expected_executions_after is -1, it's not checked.
+    bool processTicks(uint64_t num_ticks_to_process, 
+                      TestContext& ctx, 
+                      int expected_executions_after = -1, 
+                      std::chrono::milliseconds single_tick_delay = 0ms) {
+        for (uint64_t i = 0; i < num_ticks_to_process; ++i) {
+            tm_ptr->processTick();
+            if (expected_executions_after != -1 && ctx.execution_count.load() >= expected_executions_after) {
+                return true; 
+            }
+            if (single_tick_delay > 0ms) {
+                std::this_thread::sleep_for(single_tick_delay);
+            }
+        }
+        if (expected_executions_after != -1) {
+            return ctx.execution_count.load() >= expected_executions_after;
+        }
+        return true; // If no specific execution count to check, assume success
     }
 };
 
 // Timer Creation Tests
 TEST_F(TimerMgrTest, CreateOneShotTimer) {
     SetUp(BaseInterval::MS10);
-    uint64_t interval_ms = 5 * getBaseMs(); // 50ms
+    uint64_t interval_ms = 5 * getBaseMs(); // 50ms, requires 5 ticks
     int64_t timer_id = tm_ptr->createTimer(generalCallback, &test_ctx, interval_ms, false);
     ASSERT_NE(timer_id, -1);
 
-    EXPECT_TRUE(test_ctx.waitForExecutions(1, std::chrono::milliseconds(interval_ms * 2 + 50)));
+    // Process enough ticks for the timer to fire (e.g., interval_ms / getBaseMs() + buffer)
+    processTicks(interval_ms / getBaseMs() + 2, test_ctx, 1);
     EXPECT_EQ(test_ctx.execution_count.load(), 1);
     EXPECT_EQ(test_ctx.last_cookie, &test_ctx);
 
     // Ensure it doesn't fire again
-    std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms * 2));
-    EXPECT_EQ(test_ctx.execution_count.load(), 1);
+    int count_after_fire = test_ctx.execution_count.load();
+    processTicks(10, test_ctx); // Process more ticks
+    EXPECT_EQ(test_ctx.execution_count.load(), count_after_fire);
+    
     EXPECT_TRUE(tm_ptr->removeTimer(timer_id));
 }
 
 TEST_F(TimerMgrTest, CreateCyclicTimer) {
     SetUp(BaseInterval::MS10);
-    uint64_t interval_ms = 3 * getBaseMs(); // 30ms
+    uint64_t interval_ms = 3 * getBaseMs(); // 30ms, 3 ticks per fire
     int expected_fires = 3;
     int64_t timer_id = tm_ptr->createTimer(generalCallback, &test_ctx, interval_ms, true);
     ASSERT_NE(timer_id, -1);
 
-    EXPECT_TRUE(test_ctx.waitForExecutions(expected_fires, std::chrono::milliseconds(interval_ms * (expected_fires + 1) + 50)));
-    EXPECT_GE(test_ctx.execution_count.load(), expected_fires); // Could be more if test is slow
-    EXPECT_LE(test_ctx.execution_count.load(), expected_fires + 1); // Check it's not firing too rapidly
+    // Process enough ticks for expected_fires
+    // Total ticks needed: (expected_fires * interval_ticks) + buffer
+    uint64_t ticks_per_fire = interval_ms / getBaseMs();
+    processTicks(expected_fires * ticks_per_fire + 2, test_ctx, expected_fires);
+    
+    // Check if it fired approximately 'expected_fires' times.
+    // With external ticks, it should be exact if enough ticks are processed.
+    EXPECT_EQ(test_ctx.execution_count.load(), expected_fires);
     EXPECT_EQ(test_ctx.last_cookie, &test_ctx);
 
     EXPECT_TRUE(tm_ptr->stopTimer(timer_id));
     int count_after_stop = test_ctx.execution_count.load();
-    std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms * 2));
+    processTicks(ticks_per_fire * 2 + 2, test_ctx); // Process more ticks
     EXPECT_EQ(test_ctx.execution_count.load(), count_after_stop); // Should not increase after stop
 
     EXPECT_TRUE(tm_ptr->removeTimer(timer_id));
@@ -216,7 +242,10 @@ TEST_F(TimerMgrTest, CreateManyTimers) {
         timer_ids.push_back(id);
     }
 
-    EXPECT_TRUE(test_ctx.waitForExecutions(num_timers, std::chrono::milliseconds(interval_ms * num_timers / 10 + 200))); // Heuristic timeout
+    // Process enough ticks for all timers to fire. Longest timer is interval_ms + 4*getBaseMs()
+    uint64_t max_interval_ms = interval_ms + 4 * getBaseMs();
+    uint64_t ticks_to_process = max_interval_ms / getBaseMs() + 2;
+    processTicks(ticks_to_process, test_ctx, num_timers);
     EXPECT_EQ(test_ctx.execution_count.load(), num_timers);
 
     for (int64_t id : timer_ids) {
@@ -232,8 +261,9 @@ TEST_F(TimerMgrTest, StopTimerBeforeExpiry) {
     ASSERT_NE(timer_id, -1);
 
     EXPECT_TRUE(tm_ptr->stopTimer(timer_id));
-    yield(std::chrono::milliseconds(interval_ms * 2)); // Wait well past expected expiry
     
+    // Process enough ticks that it would have fired if not stopped
+    processTicks(interval_ms / getBaseMs() + 5, test_ctx); 
     EXPECT_EQ(test_ctx.execution_count.load(), 0);
     EXPECT_TRUE(tm_ptr->removeTimer(timer_id)); // Cleanup
 }
@@ -261,12 +291,13 @@ TEST_F(TimerMgrTest, RestartOneShot_AfterExpiry) {
     int64_t timer_id = tm_ptr->createTimer(generalCallback, &test_ctx, interval_ms, false);
     ASSERT_NE(timer_id, -1);
 
-    EXPECT_TRUE(test_ctx.waitForExecutions(1, std::chrono::milliseconds(interval_ms * 2 + 20)));
+    uint64_t ticks_for_interval = interval_ms / getBaseMs();
+    processTicks(ticks_for_interval + 2, test_ctx, 1); // Process enough for it to fire
     EXPECT_EQ(test_ctx.execution_count.load(), 1);
 
     test_ctx.reset(); // Reset counter for next phase
     EXPECT_TRUE(tm_ptr->restartTimer(timer_id));
-    EXPECT_TRUE(test_ctx.waitForExecutions(1, std::chrono::milliseconds(interval_ms * 2 + 20)));
+    processTicks(ticks_for_interval + 2, test_ctx, 1); // Process enough for it to fire again
     EXPECT_EQ(test_ctx.execution_count.load(), 1);
     
     EXPECT_TRUE(tm_ptr->removeTimer(timer_id));
@@ -279,11 +310,11 @@ TEST_F(TimerMgrTest, RestartOneShot_StoppedThenRestart) {
     ASSERT_NE(timer_id, -1);
 
     EXPECT_TRUE(tm_ptr->stopTimer(timer_id));
-    yield(std::chrono::milliseconds(interval_ms)); // Ensure it would have fired if not stopped
+    processTicks(interval_ms / getBaseMs() + 2, test_ctx); // Process past original expiry
     EXPECT_EQ(test_ctx.execution_count.load(), 0);
 
     EXPECT_TRUE(tm_ptr->restartTimer(timer_id));
-    EXPECT_TRUE(test_ctx.waitForExecutions(1, std::chrono::milliseconds(interval_ms * 2 + 20)));
+    processTicks(interval_ms / getBaseMs() + 2, test_ctx, 1); // Process for new interval
     EXPECT_EQ(test_ctx.execution_count.load(), 1);
 
     EXPECT_TRUE(tm_ptr->removeTimer(timer_id));
@@ -291,22 +322,19 @@ TEST_F(TimerMgrTest, RestartOneShot_StoppedThenRestart) {
 
 TEST_F(TimerMgrTest, RestartOneShot_Running) {
     SetUp(BaseInterval::MS10);
-    uint64_t interval_ms = 10 * getBaseMs(); // 100ms
+    uint64_t interval_ms = 10 * getBaseMs(); // 100ms, 10 ticks
     int64_t timer_id = tm_ptr->createTimer(generalCallback, &test_ctx, interval_ms, false);
     ASSERT_NE(timer_id, -1);
 
-    yield(std::chrono::milliseconds(interval_ms / 2)); // Let it run for a bit
+    processTicks(interval_ms / getBaseMs() / 2, test_ctx); // Process for half the interval (5 ticks)
+    EXPECT_EQ(test_ctx.execution_count.load(), 0); 
     EXPECT_TRUE(tm_ptr->restartTimer(timer_id)); // Restart it
-    // It should fire 'interval_ms' after the restart, not 'interval_ms / 2'
     
-    // Total wait time: interval_ms/2 (initial) + interval_ms (restarted)
-    // We expect 1 execution total. waitForExecutions checks '>=1'.
-    // Need to ensure it doesn't fire early.
-    // Wait for slightly less than new expiry time from now.
-    std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms - getBaseMs()));
+    // It should fire 'interval_ms' (10 ticks) after the restart
+    processTicks(interval_ms / getBaseMs() - 1, test_ctx); // Process for 9 ticks from restart
     EXPECT_EQ(test_ctx.execution_count.load(), 0); // Should not have fired yet
 
-    EXPECT_TRUE(test_ctx.waitForExecutions(1, std::chrono::milliseconds(getBaseMs() * 3 + 20))); // Wait for the remaining time + buffer
+    processTicks(2, test_ctx, 1); // Process 2 more ticks (total 11 from restart, 1 past new expiry)
     EXPECT_EQ(test_ctx.execution_count.load(), 1);
 
     EXPECT_TRUE(tm_ptr->removeTimer(timer_id));
@@ -315,17 +343,19 @@ TEST_F(TimerMgrTest, RestartOneShot_Running) {
 
 TEST_F(TimerMgrTest, RestartCyclicTimer) {
     SetUp(BaseInterval::MS10);
-    uint64_t interval_ms = 3 * getBaseMs(); // 30ms
+    uint64_t interval_ms = 3 * getBaseMs(); // 30ms, 3 ticks
+    uint64_t ticks_per_fire = interval_ms / getBaseMs();
     int64_t timer_id = tm_ptr->createTimer(generalCallback, &test_ctx, interval_ms, true);
     ASSERT_NE(timer_id, -1);
 
-    EXPECT_TRUE(test_ctx.waitForExecutions(2, std::chrono::milliseconds(interval_ms * 3 + 20))); // Let it fire twice
-    
+    processTicks(ticks_per_fire * 2 + 1, test_ctx, 2); // Let it fire twice (e.g. 7 ticks)
+    EXPECT_EQ(test_ctx.execution_count.load(), 2);
+        
     test_ctx.reset(); // Reset for counting after restart
     EXPECT_TRUE(tm_ptr->restartTimer(timer_id));
     
-    EXPECT_TRUE(test_ctx.waitForExecutions(2, std::chrono::milliseconds(interval_ms * 3 + 20))); // Should fire twice more after restart
-    EXPECT_GE(test_ctx.execution_count.load(), 2);
+    processTicks(ticks_per_fire * 2 + 1, test_ctx, 2); // Should fire twice more after restart
+    EXPECT_EQ(test_ctx.execution_count.load(), 2);
 
     EXPECT_TRUE(tm_ptr->stopTimer(timer_id));
     EXPECT_TRUE(tm_ptr->removeTimer(timer_id));
@@ -344,7 +374,7 @@ TEST_F(TimerMgrTest, RemoveTimerBeforeExpiry) {
     ASSERT_NE(timer_id, -1);
 
     EXPECT_TRUE(tm_ptr->removeTimer(timer_id));
-    yield(std::chrono::milliseconds(interval_ms * 2)); // Wait well past expected expiry
+    processTicks(interval_ms / getBaseMs() + 5, test_ctx); // Process well past expected expiry
     EXPECT_EQ(test_ctx.execution_count.load(), 0);
 
     EXPECT_FALSE(tm_ptr->removeTimer(timer_id)); // Already removed
@@ -356,7 +386,7 @@ TEST_F(TimerMgrTest, RemoveTimerAfterExpiry_OneShot) {
     int64_t timer_id = tm_ptr->createTimer(generalCallback, &test_ctx, interval_ms, false);
     ASSERT_NE(timer_id, -1);
 
-    EXPECT_TRUE(test_ctx.waitForExecutions(1, std::chrono::milliseconds(interval_ms * 2 + 20)));
+    processTicks(interval_ms / getBaseMs() + 2, test_ctx, 1); // Process for it to fire
     EXPECT_EQ(test_ctx.execution_count.load(), 1);
     
     EXPECT_TRUE(tm_ptr->removeTimer(timer_id));
@@ -391,27 +421,27 @@ TEST_F(TimerMgrTest, CookieVerification) {
     int64_t id2 = tm_ptr->createTimer(generalCallback, &c2, 3 * getBaseMs(), false);
     ASSERT_NE(id2, -1);
 
-    // Wait for both
-    EXPECT_TRUE(test_ctx.waitForExecutions(2, 100ms));
-    EXPECT_EQ(test_ctx.execution_count.load(), 2);
-    // last_cookie will be from the timer that fired last. This is non-deterministic here.
-    // To test cookies properly, each callback should verify its own cookie.
-    // We can use separate TestContexts or a more complex TestContext.
-
     // Refined cookie test:
     TestContext ctx1, ctx2;
-    id1 = tm_ptr->createTimer(generalCallback, &ctx1, 2 * getBaseMs(), false); // 20ms
+    uint64_t interval1_ms = 2 * getBaseMs(); // 20ms, 2 ticks
+    uint64_t interval2_ms = 3 * getBaseMs(); // 30ms, 3 ticks
+
+    int64_t id1 = tm_ptr->createTimer(generalCallback, &ctx1, interval1_ms, false);
     ASSERT_NE(id1, -1);
-    id2 = tm_ptr->createTimer(generalCallback, &ctx2, 3 * getBaseMs(), false); // 30ms
+    int64_t id2 = tm_ptr->createTimer(generalCallback, &ctx2, interval2_ms, false);
     ASSERT_NE(id2, -1);
 
-    EXPECT_TRUE(ctx1.waitForExecutions(1, 50ms));
-    EXPECT_EQ(ctx1.last_cookie, &ctx1);
+    // Process enough ticks for both. Max is 3 ticks. Let's do 5.
+    for (int i=0; i<5; ++i) {
+        tm_ptr->processTick();
+        if (ctx1.execution_count.load() >= 1 && ctx2.execution_count.load() >=1) break;
+    }
+    
     EXPECT_EQ(ctx1.execution_count.load(), 1);
-
-    EXPECT_TRUE(ctx2.waitForExecutions(1, 60ms));
-    EXPECT_EQ(ctx2.last_cookie, &ctx2);
+    EXPECT_EQ(ctx1.last_cookie, &ctx1);
+    
     EXPECT_EQ(ctx2.execution_count.load(), 1);
+    EXPECT_EQ(ctx2.last_cookie, &ctx2);
     
     tm_ptr->removeTimer(id1);
     tm_ptr->removeTimer(id2);
@@ -425,17 +455,15 @@ TEST_F(TimerMgrTest, ConcurrentTimerCreations) {
     const int timers_per_thread = 10;
     std::vector<std::thread> threads;
     std::atomic<int> created_timer_ids_count{0};
-    std::vector<int64_t> all_timer_ids; // Needs mutex if threads modify it
+    std::vector<int64_t> all_timer_ids; 
     std::mutex vector_mutex;
 
-    uint64_t interval_ms = 2 * getBaseMs(); // 20ms
+    uint64_t interval_ms = 2 * getBaseMs(); // 20ms, 2 ticks
 
     for (int i = 0; i < num_threads; ++i) {
         threads.emplace_back([&]() {
             std::vector<int64_t> local_ids;
             for (int j = 0; j < timers_per_thread; ++j) {
-                // Each timer callback needs to know its TestContext.
-                // For simplicity, all use the global test_ctx.
                 int64_t id = tm_ptr->createTimer(generalCallback, &test_ctx, interval_ms + (j%2)*getBaseMs(), false);
                 if (id != -1) {
                     created_timer_ids_count++;
@@ -453,55 +481,69 @@ TEST_F(TimerMgrTest, ConcurrentTimerCreations) {
 
     int total_timers = num_threads * timers_per_thread;
     EXPECT_EQ(created_timer_ids_count.load(), total_timers);
-    EXPECT_TRUE(test_ctx.waitForExecutions(total_timers, std::chrono::milliseconds(interval_ms * timers_per_thread + 500))); // Heuristic
+    
+    // Process enough ticks for all timers to fire. Max interval is 20ms + 1*10ms = 30ms (3 ticks)
+    processTicks( (interval_ms + getBaseMs()) / getBaseMs() + 2, test_ctx, total_timers);
     EXPECT_EQ(test_ctx.execution_count.load(), total_timers);
 
     for (int64_t id : all_timer_ids) {
-        tm_ptr->removeTimer(id); // Clean up
+        tm_ptr->removeTimer(id); 
     }
 }
 
 TEST_F(TimerMgrTest, ConcurrentStopAndRestart) {
-    SetUp(BaseInterval::MS10);
+    SetUp(BaseInterval::MS100); // Slower base for easier concurrent observation
     const int num_ops_threads = 5;
-    uint64_t interval_ms = 20 * getBaseMs(); // 200ms, long enough to be manipulated
+    uint64_t interval_ms = 3 * getBaseMs(); // 300ms, 3 ticks
+    uint64_t ticks_per_interval = interval_ms / getBaseMs();
 
-    // Create a few timers to operate on
-    std::vector<int64_t> timer_ids;
+    std::vector<int64_t> timer_ids_vec;
     std::vector<TestContext> contexts(5);
     for(int i=0; i<5; ++i) {
         contexts[i].reset();
         int64_t id = tm_ptr->createTimer(generalCallback, &contexts[i], interval_ms, true); // Cyclic
         ASSERT_NE(id, -1);
-        timer_ids.push_back(id);
+        timer_ids_vec.push_back(id);
     }
 
-    std::vector<std::thread> threads;
+    std::atomic<bool> keep_ticking{true};
+    std::thread ticker_thread([&]() {
+        while(keep_ticking.load()) {
+            tm_ptr->processTick();
+            std::this_thread::sleep_for(getBaseMs()); // Tick at approx base interval rate
+        }
+    });
+
+    std::vector<std::thread> op_threads;
     for (int i = 0; i < num_ops_threads; ++i) {
-        threads.emplace_back([&, i]() {
-            int64_t target_id = timer_ids[i % timer_ids.size()];
-            for(int k=0; k<5; ++k) { // Multiple operations per thread
+        op_threads.emplace_back([&, i]() {
+            int64_t target_id = timer_ids_vec[i % timer_ids_vec.size()];
+            for(int k=0; k<3; ++k) { // Multiple operations per thread
                 tm_ptr->stopTimer(target_id);
-                yield(getBaseMs()); // small yield
+                std::this_thread::sleep_for(getBaseMs()/2); // Small delay between ops
                 tm_ptr->restartTimer(target_id);
-                yield(getBaseMs());
+                std::this_thread::sleep_for(getBaseMs()/2);
             }
         });
     }
 
-    for (auto& t : threads) {
+    for (auto& t : op_threads) {
         t.join();
     }
 
-    // Check that timers are still running and firing after concurrent ops
-    // This is hard to assert definitively without knowing the exact state.
-    // We expect them to be running. Let's check for some activity.
-    std::this_thread::sleep_for(interval_ms * 2); // Let them run for a couple of cycles
-
+    // Let ticker run for a few more cycles to ensure restarted timers fire
+    std::this_thread::sleep_for(interval_ms * 2); 
+    keep_ticking = false;
+    if(ticker_thread.joinable()) {
+        ticker_thread.join();
+    }
+    
     for(int i=0; i<5; ++i) {
-        EXPECT_GE(contexts[i].execution_count.load(), 1) << "Timer " << timer_ids[i] << " should have fired at least once after ops.";
-        tm_ptr->stopTimer(timer_ids[i]); // Stop them
-        tm_ptr->removeTimer(timer_ids[i]); // Clean up
+        // Check if timers fired at least once after all operations.
+        // The exact count is hard to predict due to concurrency.
+        EXPECT_GE(contexts[i].execution_count.load(), 1) << "Timer " << timer_ids_vec[i] << " should have fired at least once after ops.";
+        tm_ptr->stopTimer(timer_ids_vec[i]); 
+        tm_ptr->removeTimer(timer_ids_vec[i]); 
     }
 }
 
@@ -509,39 +551,42 @@ TEST_F(TimerMgrTest, ConcurrentStopAndRestart) {
 // Edge Cases & Robustness
 TEST_F(TimerMgrTest, TimerWithShortestInterval) {
     SetUp(BaseInterval::MS10);
-    uint64_t interval_ms = getBaseMs(); // 10ms
+    uint64_t interval_ms = getBaseMs(); // 10ms, 1 tick
     int64_t timer_id = tm_ptr->createTimer(generalCallback, &test_ctx, interval_ms, false);
     ASSERT_NE(timer_id, -1);
 
-    EXPECT_TRUE(test_ctx.waitForExecutions(1, std::chrono::milliseconds(interval_ms * 3 + 20)));
+    processTicks(1 + 2, test_ctx, 1); // Process 1 tick for expiry + buffer
     EXPECT_EQ(test_ctx.execution_count.load(), 1);
     tm_ptr->removeTimer(timer_id);
 }
 
 TEST_F(TimerMgrTest, SequenceOfOperations) {
     SetUp(BaseInterval::MS10);
-    uint64_t interval_ms = 5 * getBaseMs(); // 50ms
+    uint64_t interval_ms = 5 * getBaseMs(); // 50ms, 5 ticks
+    uint64_t ticks_for_interval = interval_ms / getBaseMs();
     int64_t timer_id = tm_ptr->createTimer(generalCallback, &test_ctx, interval_ms, false);
     ASSERT_NE(timer_id, -1);
 
     // Stop -> Start (Restart)
     EXPECT_TRUE(tm_ptr->stopTimer(timer_id));
-    yield(interval_ms);
+    processTicks(ticks_for_interval + 2, test_ctx); // Process past original expiry
     EXPECT_EQ(test_ctx.execution_count.load(), 0);
+    
     EXPECT_TRUE(tm_ptr->restartTimer(timer_id));
-    EXPECT_TRUE(test_ctx.waitForExecutions(1, std::chrono::milliseconds(interval_ms * 2 + 20)));
+    processTicks(ticks_for_interval + 2, test_ctx, 1); // Process for new interval
     EXPECT_EQ(test_ctx.execution_count.load(), 1);
 
     // Stop -> Start (Restart) again
     test_ctx.reset();
-    EXPECT_TRUE(tm_ptr->stopTimer(timer_id)); // Timer is one-shot, already fired and implicitly stopped by not being cyclic.
-                                             // So stopTimer should reflect it's not 'running' for next callback.
-                                             // Or, if it's about being in m_timers, it is.
-                                             // Current stopTimer logic: sets isRunning = false.
-    yield(interval_ms);
+    // Timer is one-shot. After firing it's isRunning = false.
+    // stopTimer will find it and confirm it's not running (or mark it so).
+    EXPECT_TRUE(tm_ptr->stopTimer(timer_id)); 
+                                             
+    processTicks(ticks_for_interval + 2, test_ctx);
     EXPECT_EQ(test_ctx.execution_count.load(), 0);
+    
     EXPECT_TRUE(tm_ptr->restartTimer(timer_id)); // Restart means it will run again
-    EXPECT_TRUE(test_ctx.waitForExecutions(1, std::chrono::milliseconds(interval_ms * 2 + 20)));
+    processTicks(ticks_for_interval + 2, test_ctx, 1);
     EXPECT_EQ(test_ctx.execution_count.load(), 1);
 
     // Remove
@@ -555,23 +600,24 @@ class TimerMgrTestDifferentBase : public TimerMgrTest {
 
 TEST_F(TimerMgrTestDifferentBase, OneShotWithS1Base) {
     SetUp(BaseInterval::S1); // 1 second base interval
-    uint64_t interval_ms = 2 * getBaseMs(); // 2000ms
+    uint64_t interval_ms = 2 * getBaseMs(); // 2000ms, 2 ticks
+    uint64_t ticks_for_interval = interval_ms / getBaseMs();
     
-    auto start_time = std::chrono::steady_clock::now();
+    auto start_time = std::chrono::steady_clock::now(); // Still useful for rough validation
     int64_t timer_id = tm_ptr->createTimer(generalCallback, &test_ctx, interval_ms, false);
     ASSERT_NE(timer_id, -1);
 
-    EXPECT_TRUE(test_ctx.waitForExecutions(1, std::chrono::milliseconds(interval_ms + 500))); // Wait up to 2.5s
+    processTicks(ticks_for_interval + 1, test_ctx, 1); // Process 2 ticks for expiry + buffer
     auto end_time = std::chrono::steady_clock::now();
     
     EXPECT_EQ(test_ctx.execution_count.load(), 1);
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
     
-    // Check if it fired approximately after interval_ms
-    EXPECT_GE(duration.count(), interval_ms);
-    // Allow some slack for scheduling, timer thread processing, etc.
-    // For a 2s timer with 1s base, it might fire between 2s and 3s.
-    EXPECT_LT(duration.count(), interval_ms + getBaseMs() + 500ms); // interval + base_interval + buffer
+    // Check if it fired approximately after interval_ms. This is harder to guarantee with manual ticks.
+    // The main check is that it fired after the correct number of ticks.
+    // The actual time taken is less relevant unless processTicks has delays.
+    // EXPECT_GE(duration.count(), interval_ms); 
+    // EXPECT_LT(duration.count(), interval_ms + getBaseMs() * (ticks_for_interval + 5) ); // Looser timing check
     
     tm_ptr->removeTimer(timer_id);
 }

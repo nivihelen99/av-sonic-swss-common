@@ -49,8 +49,7 @@ TimerMgr::TimerMgr(BaseInterval interval)
     : m_baseInterval(interval),
       m_currentTick(0),
       m_nextTimerId(0),
-      m_timerFd(-1), // Initialize m_timerFd to an invalid value
-      m_running(false) { // Initialize m_running to false initially
+      m_timerFd(-1) { // m_running removed
     try {
         m_baseIntervalNs = baseIntervalToNs(m_baseInterval);
     } catch (const std::invalid_argument& e) {
@@ -64,58 +63,16 @@ TimerMgr::TimerMgr(BaseInterval interval)
         throw std::runtime_error("timerfd_create failed");
     }
 
-    m_running = true;
-    try {
-        m_timerThread = std::thread(&TimerMgr::timerThreadFunc, this);
-        // Detaching the thread as per requirement.
-        // Note: Careful consideration for detached threads is needed,
-        // especially for resource cleanup if the TimerMgr object is destroyed
-        // before the thread naturally finishes. The destructor handles this.
-        m_timerThread.detach();
-    } catch (const std::system_error& e) {
-        m_running = false; // Ensure m_running is false if thread creation fails
-        if (m_timerFd != -1) {
-            close(m_timerFd);
-            m_timerFd = -1;
-        }
-        SWSS_LOG_ERROR("Failed to create timer thread: " << e.what());
-        throw; // Re-throw the exception
-    }
-    SWSS_LOG_INFO("TimerMgr started with base interval: " << baseIntervalToMs(m_baseInterval) << " ms");
+    // m_running and m_timerThread related code removed.
+    // SWSS_LOG_INFO("TimerMgr initialized with base interval: " << baseIntervalToMs(m_baseInterval) << " ms");
+    // Initial call to updateTimerFd to arm/disarm based on current state (likely disarmed)
+    std::lock_guard<std::mutex> lock(m_mutex); // updateTimerFd expects lock to be held
+    updateTimerFd();
 }
 
 TimerMgr::~TimerMgr() {
-    SWSS_LOG_INFO("TimerMgr shutting down...");
-    m_running = false; // Signal the timer thread to stop
-
-    if (m_timerFd != -1) {
-        // To wake up the thread if it's in read() or blocked on timerfd_settime,
-        // we can disarm the timer and then make a small write or just close it.
-        // Setting a very short timer is a reliable way to wake it up.
-        struct itimerspec its_disarm_wakeup {};
-        its_disarm_wakeup.it_value.tv_nsec = 1; // Wake up almost immediately
-        // TFD_TIMER_ABSTIME not set, so relative time
-        if (timerfd_settime(m_timerFd, 0, &its_disarm_wakeup, nullptr) == -1) {
-            SWSS_LOG_ERROR("~TimerMgr: timerfd_settime to wake thread failed: " << strerror(errno));
-            // Potentially, the thread might not wake up if it was in a state
-            // where this settime doesn't affect it. However, read() should return.
-        }
-        // Note: The problem description mentions m_timerThread.join().
-        // If the thread is detached, we cannot join it.
-        // For a detached thread, it must manage its own lifecycle or communicate
-        // its completion if needed. Given the prompt specified detach,
-        // we will proceed with that. If join is strictly required, the thread
-        // should not be detached. Assuming the destructor's responsibility is to
-        // signal shutdown and clean up resources it directly owns (like m_timerFd).
-        // The detached thread will see m_running = false and exit.
-        // A robust solution for joinable threads would involve a condition variable.
-        // For now, following the "detach" instruction.
-    }
-    
-    // If thread was joinable, it would be:
-    // if (m_timerThread.joinable()) {
-    //     m_timerThread.join();
-    // }
+    // SWSS_LOG_INFO("TimerMgr shutting down...");
+    // m_running and thread signaling code removed.
 
     if (m_timerFd != -1) {
         close(m_timerFd);
@@ -172,212 +129,92 @@ void TimerMgr::updateTimerFd() {
     }
 }
 
-void TimerMgr::timerThreadFunc() {
-    SWSS_LOG_INFO("Timer thread started.");
-    uint64_t expirations; // Value read from timerfd
+// void TimerMgr::timerThreadFunc() { ... } // Entire function removed
 
-    while (m_running) {
-        if (m_timerFd == -1) { // Should not happen if constructor succeeded
-             SWSS_LOG_ERROR("timerThreadFunc: m_timerFd is invalid. Exiting thread.");
-             break;
+
+void TimerMgr::processTick() {
+    // Step 1: Consume event from timer_fd.
+    uint64_t fd_expirations = 0;
+    ssize_t ret = read(m_timerFd, &fd_expirations, sizeof(fd_expirations));
+
+    if (ret == -1) {
+        if (errno == EINTR) {
+            // SWSS_LOG_INFO("TimerMgr: read from timer_fd interrupted by signal.");
+            return; // Wait for next call
+        } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            SWSS_LOG_ERROR("TimerMgr: Failed to read from timer_fd: " << strerror(errno));
+            // Depending on severity, could throw or just log.
         }
-        ssize_t s = read(m_timerFd, &expirations, sizeof(expirations));
+        // If EAGAIN/EWOULDBLOCK or other error, fd_expirations remains 0 or is uninitialized.
+        // Best to ensure it's 0 if we proceed.
+        fd_expirations = 0;
+    } else if (ret == 0) {
+        SWSS_LOG_NOTICE("TimerMgr: Read 0 bytes from timer_fd, unexpected EOF.");
+        fd_expirations = 0;
+    }
+    // fd_expirations is now set. Its value isn't critical for tick advancement here,
+    // but reading clears the m_timerFd for external pollers.
 
-        if (!m_running) { // Check m_running again after read returns
-            break;
-        }
+    std::vector<std::pair<std::function<void(void*)>, void*>> callbacksToRun;
 
-        if (s == sizeof(expirations)) {
-            // Timer fired
-            // The value 'expirations' indicates how many times the timer has expired
-            // since the last read. For a high-frequency base interval, this could be > 1.
-            // We simply advance our current tick.
-            // A more precise tick update would involve CLOCK_MONOTONIC if exactness is critical
-            // beyond the timerfd notifications. But for a tick-based system, this is typical.
-            // m_currentTick += expirations; // This might advance tick too fast if not careful.
-                                         // The design implies m_currentTick is our logical tick
-                                         // that advances when the *next* scheduled event is due.
-                                         // Let's increment m_currentTick only when we process events
-                                         // that are due at m_currentTick.
-                                         // The read() just unblocks us. The actual current time
-                                         // for event processing is derived from m_activeTimers.top().first
-                                         // or by simply incrementing m_currentTick by 1 for each base interval.
+    { // Mutex scope
+        std::lock_guard<std::mutex> lock(m_mutex);
 
-            // The problem description for timerThreadFunc said:
-            // "If read() returns a value > 0... Increment m_currentTick."
-            // This means m_currentTick advances by the number of base intervals
-            // that timerfd is configured for.
-            // However, our updateTimerFd configures timerfd for a variable duration
-            // until the *next* timer. So 'expirations' will typically be 1.
-            // Let's assume m_currentTick should reflect the passage of time.
-            // If updateTimerFd sets the timer to fire at `delayTicks` from `m_currentTick`,
-            // then upon firing, `m_currentTick` should advance by `delayTicks`.
-            // This needs careful synchronization with how `updateTimerFd` calculates delays.
+        // Step 2: Advance current tick.
+        m_currentTick++;
 
-            // Re-evaluating: The purpose of m_currentTick is to be the reference
-            // for scheduling. When timerfd fires, it means time has advanced AT LEAST
-            // to the point of the earliest timer.
-            // The safest way is to process timers based on their expirationTick.
-            // m_currentTick should advance to the tick of the timer(s) just processed.
-        } else if (s == -1) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // Non-blocking read, no event. This can happen if timerfd was disarmed
-                // or if a signal interrupted read before any timer event.
-                // Or if we woke up due to destructor.
-                // We should check m_running and potentially re-arm if needed.
-                if (!m_running) break; // Exit if shutting down
-
-                // If we woke up spuriously and there are active timers,
-                // ensure timerfd is correctly armed.
-                std::lock_guard<std::mutex> lock(m_mutex);
-                if (!m_activeTimers.empty() && m_running) {
-                     // It's possible timerfd was disarmed by stopTimer or removeTimer
-                     // or if all timers were removed and then a new one added.
-                     // updateTimerFd will re-evaluate and arm if necessary.
-                    updateTimerFd();
-                }
-                // Sleep for a very short duration to prevent busy spinning if continuously getting EAGAIN
-                // This is a failsafe; ideally, timerfd is managed such that EAGAIN is not spammed.
-                // struct timespec short_sleep = {0, 10000000}; // 10ms
-                // nanosleep(&short_sleep, nullptr);
-                // However, a properly managed timerfd (armed when timers exist, disarmed when not)
-                // should mean read() blocks until a timer fires or it's interrupted.
-                // EAGAIN here might mean it was disarmed.
-                continue; // Re-check m_running and loop
-            } else if (errno == EINTR) {
-                SWSS_LOG_INFO("timerThreadFunc: read interrupted by signal, continuing.");
-                continue;
-            } else {
-                SWSS_LOG_ERROR("timerThreadFunc: read from timerfd failed: " << strerror(errno) << ". Exiting thread.");
-                m_running = false; // Stop the loop
-                break;
-            }
-        } else if (s == 0) {
-            // EOF, should not happen for timerfd
-            SWSS_LOG_ERROR("timerThreadFunc: read from timerfd returned 0 (EOF). Exiting thread.");
-            m_running = false;
-            break;
-        }
-
-
-        // Process Timers
-        std::unique_lock<std::mutex> lock(m_mutex);
-        if (!m_running) { // Check again after acquiring lock
-            break;
-        }
-
-        // Advance current tick. If timerfd fired, time has passed.
-        // The most robust way to set m_currentTick is to align it with the earliest expired timer.
-        // If multiple timers expired "at the same time" (same tick), process all of them.
-        if (!m_activeTimers.empty() && m_activeTimers.top().first > m_currentTick) {
-             // If the earliest timer is in the future relative to current tick,
-             // advance current tick. This can happen if timerfd fires slightly early
-             // or if `expirations` from read indicated multiple ticks passed.
-             // For a one-shot timerfd set by updateTimerFd, m_currentTick should ideally
-             // be set to m_activeTimers.top().first when that timer fires.
-            // m_currentTick = m_activeTimers.top().first;
-            // Let's simplify: when timerfd fires, it means we are at least at the tick of the next timer.
-            // The number of expirations 's' from read() is how many times the *kernel* timer fired.
-            // If our updateTimerFd sets it to fire in 'delayTicks' base intervals, then 'expirations'
-            // should be 1. Then m_currentTick should advance by 'delayTicks'.
-            // This is getting complicated. Let's use a simpler model for m_currentTick:
-            // It advances by 1 for each "fundamental" tick of the system, and timerfd
-            // is just a wake-up mechanism.
-            // The problem says "Increment m_currentTick" if read > 0.
-            // This implies m_timerFd is configured as a periodic timer of m_baseIntervalNs.
-            // If so, updateTimerFd() logic needs to change.
-            //
-            // Let's assume updateTimerFd() sets a ONE-SHOT timer for the NEXT event.
-            // When it fires, m_currentTick becomes that next event's time.
-            if (s == sizeof(expirations) && !m_activeTimers.empty()) {
-                 // Set current tick to the expiration tick of the timer that just fired
-                 // (or the earliest one if multiple are due).
-                 m_currentTick = m_activeTimers.top().first;
-            }
-        }
-
-
+        // Step 3: Process timers
         while (!m_activeTimers.empty() && m_activeTimers.top().first <= m_currentTick) {
-            if (!m_running) break;
-
-            std::pair<uint64_t, int64_t> next_event = m_activeTimers.top();
-            int64_t timerId = next_event.second;
-            // uint64_t expectedExpirationTick = next_event.first; // not directly used after pop
-
+            int64_t timerId = m_activeTimers.top().second;
+            uint64_t actualExpirationTick = m_activeTimers.top().first;
             m_activeTimers.pop();
 
             auto it = m_timers.find(timerId);
-            if (it == m_timers.end()) {
-                SWSS_LOG_NOTICE("timerThreadFunc: Timer ID " << timerId << " not found in m_timers (expired after removal?).");
+            if (it == m_timers.end()) { // Timer removed
+                continue;
+            }
+            if (!it->second.isRunning) { // Timer stopped
                 continue;
             }
 
             TimerInfo& timerInfo = it->second;
-
-            if (!timerInfo.isRunning) { // Could have been stopped
-                // SWSS_LOG_INFO("timerThreadFunc: Timer ID " << timerId << " is not running, skipping.");
-                continue;
-            }
             
-            // Unlock mutex before calling callback to prevent deadlocks if callback tries to use TimerMgr
-            // This is a common practice but means timerInfo could be invalidated if removeTimer is called
-            // by the callback. To handle this, we can copy necessary data or re-verify after callback.
-            std::function<void(void*)> cb = timerInfo.callback;
-            void* ck = timerInfo.cookie;
-            bool is_cyclic = timerInfo.isCyclic;
-            uint64_t interval_ms = timerInfo.intervalMs;
+            callbacksToRun.push_back({timerInfo.callback, timerInfo.cookie});
 
-            // Temporarily mark as not running during callback if it's a one-shot or to prevent re-entrancy issues.
-            // For cyclic timers, we'll reschedule.
-            if (!is_cyclic) {
+            if (timerInfo.isCyclic) {
+                uint64_t baseMs = baseIntervalToMs(m_baseInterval); // Cache or pass if performance critical
+                uint64_t intervalInTicks = timerInfo.intervalMs / baseMs;
+                if (intervalInTicks == 0) intervalInTicks = 1; // Ensure progress
+
+                timerInfo.expirationTick = actualExpirationTick + intervalInTicks;
+                // If it's still in the past due to long processing or very short interval,
+                // schedule from m_currentTick to ensure it's in the future.
+                if (timerInfo.expirationTick <= m_currentTick) {
+                     timerInfo.expirationTick = m_currentTick + intervalInTicks;
+                }
+                m_activeTimers.push({timerInfo.expirationTick, timerId});
+            } else {
                 timerInfo.isRunning = false;
             }
-
-            lock.unlock();
-            // SWSS_LOG_INFO("Executing callback for timer ID " << timerId);
-            try {
-                cb(ck);
-            } catch (const std::exception& e) {
-                SWSS_LOG_ERROR("timerThreadFunc: Exception from timer callback for ID " << timerId << ": " << e.what());
-            } catch (...) {
-                SWSS_LOG_ERROR("timerThreadFunc: Unknown exception from timer callback for ID " << timerId);
-            }
-            lock.lock(); // Re-acquire lock
-
-            if (!m_running) break; // Check again after callback
-
-            // Re-check if timer still exists, as callback might have removed it.
-            it = m_timers.find(timerId);
-            if (it == m_timers.end()) {
-                // SWSS_LOG_INFO("timerThreadFunc: Timer ID " << timerId << " removed during callback.");
-                continue; // Timer was removed by its own callback
-            }
-            // TimerInfo& currentTimerInfo = it->second; // Get fresh reference
-
-            if (is_cyclic && it->second.isRunning) { // Check isRunning again, could be stopped in callback
-                uint64_t intervalInBaseTicks = interval_ms / baseIntervalToMs(m_baseInterval);
-                if (intervalInBaseTicks == 0) intervalInBaseTicks = 1; // Ensure progress
-
-                it->second.expirationTick = m_currentTick + intervalInBaseTicks;
-                m_activeTimers.push({it->second.expirationTick, timerId});
-                // SWSS_LOG_INFO("Rescheduled cyclic timer ID " << timerId << " to tick " << it->second.expirationTick);
-            } else if (!is_cyclic) {
-                // One-shot timer has fired. It's already marked !isRunning.
-                // If it needs to be restarted, user calls restartTimer.
-                // SWSS_LOG_INFO("One-shot timer ID " << timerId << " completed.");
-            }
-        } // end while m_activeTimers
-
-        if (m_running) { // Only update timerfd if still running
-            updateTimerFd(); // Re-arm for the next closest timer with m_mutex still held
         }
-    } // end while m_running
 
-    SWSS_LOG_INFO("Timer thread finished.");
+        // Step 4: Re-arm the timer_fd for the next actual event.
+        updateTimerFd();
+    } // Mutex releases here
+
+    // Step 5: Run callbacks outside of the mutex lock
+    for (const auto& cb_pair : callbacksToRun) {
+        if (cb_pair.first) {
+            try {
+                cb_pair.first(cb_pair.second);
+            } catch (const std::exception &e) {
+                SWSS_LOG_ERROR("TimerMgr: Exception from timer callback: " << e.what());
+            } catch (...) {
+                SWSS_LOG_ERROR("TimerMgr: Unknown exception from timer callback");
+            }
+        }
+    }
 }
-
-
-// Public methods implementation
 
 int64_t TimerMgr::createTimer(std::function<void(void*)> callback, void* cookie, uint64_t intervalMs, bool isCyclic) {
     if (!callback) {
@@ -385,8 +222,12 @@ int64_t TimerMgr::createTimer(std::function<void(void*)> callback, void* cookie,
         return -1;
     }
     uint64_t baseMs = baseIntervalToMs(m_baseInterval);
-    if (intervalMs == 0 || intervalMs % baseMs != 0) {
-        SWSS_LOG_ERROR("createTimer: IntervalMs " << intervalMs << " must be a non-zero multiple of base interval " << baseMs << "ms.");
+    if (intervalMs == 0) {
+        SWSS_LOG_ERROR("createTimer: IntervalMs cannot be 0.");
+        return -1;
+    }
+    if (intervalMs % baseMs != 0) {
+        SWSS_LOG_ERROR("createTimer: IntervalMs " << intervalMs << " must be a multiple of base interval " << baseMs << "ms.");
         return -1;
     }
 
@@ -402,6 +243,9 @@ int64_t TimerMgr::createTimer(std::function<void(void*)> callback, void* cookie,
     newTimer.isRunning = true;
 
     uint64_t intervalInBaseTicks = intervalMs / baseMs;
+    if (intervalInBaseTicks == 0) { // Should not happen if intervalMs > 0 and intervalMs % baseMs == 0, unless baseMs > intervalMs
+        intervalInBaseTicks = 1;    // Ensure timer fires at least one tick away
+    }
     newTimer.expirationTick = m_currentTick + intervalInBaseTicks;
 
     m_timers[timerId] = newTimer;

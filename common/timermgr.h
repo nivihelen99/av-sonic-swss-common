@@ -6,10 +6,7 @@
 #include <map>
 #include <queue> // Or other suitable container for priority queue
 #include <cstdint> // For uint64_t, int64_t
-#include <thread>  // For std::thread
-
-// Forward declaration if needed by Selectable
-// namespace swss { class Selectable; }
+// #include <thread>  // For std::thread -- REMOVED as m_timerThread is removed
 
 namespace swss {
 
@@ -35,6 +32,8 @@ public:
     TimerMgr(const TimerMgr&) = delete;
     TimerMgr& operator=(const TimerMgr&) = delete;
 
+    void processTick(); // New public method
+
     int64_t createTimer(std::function<void(void*)> callback, void* cookie, uint64_t intervalMs, bool isCyclic);
     bool stopTimer(int64_t timerId);
     bool restartTimer(int64_t timerId); // For one-shot, restarts. For cyclic, resets current period.
@@ -52,7 +51,7 @@ private:
         // Add any other necessary fields
     };
 
-    void timerThreadFunc();
+    // void timerThreadFunc(); // REMOVED
     void updateTimerFd(); // Helper to re-arm the timerfd based on the next expiring timer
 
     BaseInterval m_baseInterval;
@@ -60,8 +59,8 @@ private:
     uint64_t m_currentTick;    // Current tick count
 
     int m_timerFd;
-    bool m_running;
-    std::thread m_timerThread;
+    // bool m_running; // REMOVED
+    // std::thread m_timerThread; // REMOVED
     std::mutex m_mutex;
 
     std::map<int64_t, TimerInfo> m_timers; // Stores all timers by ID
