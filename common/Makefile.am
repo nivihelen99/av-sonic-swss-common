@@ -81,7 +81,13 @@ common_libswsscommon_la_SOURCES = \
     common/c-api/zmqproducerstatetable.cpp \
     common/c-api/table.cpp                 \
     common/c-api/logger.cpp \
-    common/performancetimer.cpp
+    common/performancetimer.cpp    \
+    common/typed_redis.cpp
+
+# Headers that should be installed for use by other modules/projects
+nobase_include_HEADERS = \
+    common/typed_redis.h \
+    common/typed_redis_examples.h
 
 common_libswsscommon_la_CXXFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(LIBNL_CFLAGS) $(CODE_COVERAGE_CXXFLAGS)
 common_libswsscommon_la_CPPFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(LIBNL_CPPFLAGS) $(CODE_COVERAGE_CPPFLAGS)
