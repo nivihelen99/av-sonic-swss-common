@@ -7,10 +7,15 @@
 #include "configdb.h"    // For swss::ConfigDBConnector
 #include "common/pubsub_counters.h" // For PubSubCounters
 #include "common/counterstable.h"   // For CountersTable
+#include "common/selectable.h"      // For swss::Selectable
+#include "common/redisselect.h"     // For swss::RedisSelect
 #include <string>
 #include <vector>
-#include <map> // May be needed later for ack tracking
-#include <memory> // For std::unique_ptr
+#include <map>
+#include <set>     // For std::set
+#include <memory>  // For std::unique_ptr
+#include <mutex>   // For std::mutex
+#include <optional> // For std::optional
 
 namespace swss {
 
@@ -25,8 +30,12 @@ namespace swss {
  * @see ProducerTable
  * @see common::Message
  * @see swss::PubSubConfig
+ * @see swss::Selectable
+ * @brief Extends ProducerTable to support advanced Pub/Sub features including message prioritization,
+ *        reliable delivery with ACK/NACK, configurable delivery modes, and asynchronous ACK notifications.
+ *        It can be monitored via `select()` for asynchronous ACK/NACK group status notifications.
  */
-class AdvancedProducerTable : public ProducerTable {
+class AdvancedProducerTable : public ProducerTable, public Selectable {
 public:
     /**
      * @brief Constructor for AdvancedProducerTable using DBConnector.
@@ -109,19 +118,104 @@ public:
     /**
      * @brief Default virtual destructor.
      */
-    virtual ~AdvancedProducerTable() = default;
+    virtual ~AdvancedProducerTable();
+
+    // Asynchronous ACK notification methods
+    /**
+     * @brief Registers a correlation ID for asynchronous acknowledgment notification.
+     * @param correlation_id The correlation ID to monitor.
+     * @details The producer will subscribe to a Redis Pub/Sub channel for this correlation ID
+     *          to receive notifications when all messages in the group are ACKed or if one is NACKed.
+     */
+    void registerCorrelationForAsyncAck(const std::string& correlation_id);
+
+    /**
+     * @brief Unregisters a correlation ID from asynchronous acknowledgment monitoring.
+     * @param correlation_id The correlation ID to unregister.
+     * @param force_unsubscribe If true, also clears any stored async ACK result for this ID.
+     * @details Unsubscribes from the Redis Pub/Sub channel and cleans up internal tracking.
+     *          Should be called if the application no longer needs to wait for or check the async result,
+     *          or if `waitForAck` (which uses this mechanism internally) times out or completes.
+     *          `processAsyncAckNotifications` also calls this internally when a final notification is processed.
+     */
+    void unregisterCorrelationForAsyncAck(const std::string& correlation_id, bool force_unsubscribe = false);
+
+    /**
+     * @brief Retrieves the final asynchronous acknowledgment result for a correlation ID.
+     * @param correlation_id The correlation ID to check.
+     * @param remove_on_get If true (default), the result is removed from the internal store after retrieval,
+     *                      and the producer unsubscribes from further notifications for this correlation ID.
+     * @return std::optional<FinalAckResult> The result if a final notification has been processed, otherwise `std::nullopt`.
+     * @details This method allows polling for the result after `registerCorrelationForAsyncAck` has been called
+     *          and notifications are being processed (typically via `processAsyncAckNotifications` being triggered by `select()`).
+     */
+    std::optional<FinalAckResult> getAsyncAckResult(const std::string& correlation_id, bool remove_on_get = true);
+
+    /**
+     * @brief Processes incoming asynchronous ACK notifications from subscribed Redis channels.
+     * @details This method should be called when the producer's file descriptor (obtained via `getFd()`)
+     *          is reported as ready by `select()`, typically by calling `readData()` on this Selectable object.
+     *          It reads messages from the notification channels, parses them, stores the final results,
+     *          and unregisters/unsubscribes the corresponding correlation IDs.
+     */
+    void processAsyncAckNotifications();
+
+    // Selectable interface overrides
+    /**
+     * @brief Gets the file descriptor for asynchronous ACK notifications.
+     * @return int The file descriptor provided by `RedisSelect` for Pub/Sub. Use with `swss::Select`.
+     * @details This FD becomes readable when an ACK/NACK group notification is published on a channel
+     *          this producer instance is subscribed to via `registerCorrelationForAsyncAck`.
+     */
+    int getFd() override;
+
+    /**
+     * @brief Processes asynchronous ACK notifications when the FD from `getFd()` is ready.
+     * @return uint64_t Typically 0. The return value is not significant for event-style notifications.
+     * @details This method calls `processAsyncAckNotifications()` to handle the incoming data.
+     */
+    uint64_t readData() override;
+
+    /**
+     * @brief Checks if there are pending asynchronous ACK notifications to be processed.
+     * @return true if `m_ack_notifier_select` has data from Pub/Sub channels, false otherwise.
+     */
+    bool hasData() override;
+
+    /**
+     * @brief Checks for cached/pending data (same as `hasData()` for this implementation).
+     * @return true if `m_ack_notifier_select` has data, false otherwise.
+     */
+    bool hasCachedData() override;
+
+    /**
+     * @brief Performs operations after `readData()` has processed notifications.
+     * @details Currently a no-op as `RedisSelect::pop` (used in `processAsyncAckNotifications`)
+     *          manages its internal state. If `RedisSelect` required manual state update after reads,
+     *          it would be done here.
+     */
+    void updateAfterRead() override;
+
+    /**
+     * @brief Checks if notifications were available upon initialization.
+     * @return bool Always false for this implementation, as async ACKs are responses to produced messages.
+     */
+    bool initializedWithData() override;
 
 private:
     DBConnector* m_db; ///< Main DBConnector for producing messages.
-    DBConnector* m_ack_db_connector; ///< DBConnector for ACK tracking (can be same as m_db).
+    DBConnector* m_ack_db_connector; ///< DBConnector for ACK tracking and Pub/Sub for async ACKs.
     common::DeliveryMode m_delivery_mode; ///< Default delivery mode for messages from this producer.
     common::PriorityQueue<common::Message> m_priority_queue; ///< Internal priority queue for messages.
     swss::PubSubConfig m_config; ///< PubSub configuration settings.
     std::unique_ptr<swss::CountersTable> m_counters_table; ///< Table for Pub/Sub metrics.
     std::string m_counters_producer_queue_depth_key; ///< Cached Redis key for producer queue depth counter.
 
-    // Placeholder for direct client-side ACK tracking if needed beyond Redis.
-    // std::map<std::string, SomeAckTrackingInfo> m_ack_tracker;
+    // Asynchronous ACK members
+    std::unique_ptr<swss::RedisSelect> m_ack_notifier_select; ///< RedisSelect for subscribing to ACK notification channels.
+    std::set<std::string> m_pending_async_corr_ids;           ///< Correlation IDs being monitored for async ACKs.
+    std::map<std::string, FinalAckResult> m_async_ack_results;  ///< Stores final ACK results for correlation IDs.
+    mutable std::mutex m_async_ack_mutex;                     ///< Mutex to protect m_pending_async_corr_ids and m_async_ack_results.
 
     // TODO: Implement queue overflow handling mechanism
     // e.g., drop oldest, drop lowest priority, block producer, etc.

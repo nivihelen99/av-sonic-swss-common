@@ -156,17 +156,25 @@ public:
         return status_map;
     }
 
-    // Helper to retrieve the full serialized message from the ACK status (where it's stored for testing)
-    // This is a workaround because ProducerTable writes to a stream, which is harder to inspect atomically in a test.
-    Message getMessageFromAckStatus(const std::string& messageId) {
+    // Helper to retrieve the full serialized message from the ACK status hash.
+    Message getMessageFromAckStatusPayload(const std::string& messageId) {
         Message msg;
+        msg.id = messageId; // Set the ID for context, even if parsing fails
         auto status_map = getAckStatus(messageId);
         if (status_map.count(Message::MSG_PAYLOAD_FIELD)) {
-            Json j = Json::parse(status_map[Message::MSG_PAYLOAD_FIELD]);
-            swss::from_json(j, msg);
-        } else { // Fallback: if MSG_PAYLOAD_FIELD is not there, try to reconstruct from other fields
+            try {
+                Json j = Json::parse(status_map[Message::MSG_PAYLOAD_FIELD]);
+                swss::from_json(j, msg); // This will populate all fields from the serialized Message
+            } catch (const std::exception& e) {
+                SWSS_LOG_ERROR("Failed to parse MSG_PAYLOAD_FIELD for message %s: %s", messageId.c_str(), e.what());
+                // msg will be partially populated or default
+            }
+        } else {
+             SWSS_LOG_WARN("MSG_PAYLOAD_FIELD not found in status for message %s", messageId.c_str());
+             // Try to populate from individual fields if they exist (for older formats or partial data)
             if (status_map.count(Message::MSG_STAT_FIELD_TABLE_NAME)) msg.original_table_name = status_map[Message::MSG_STAT_FIELD_TABLE_NAME];
-            // ... (this part is less critical if MSG_PAYLOAD_FIELD is always stored)
+            if (status_map.count(Message::MSG_STAT_FIELD_CORR_ID)) msg.correlation_id = status_map[Message::MSG_STAT_FIELD_CORR_ID];
+            // original_key is not typically in status hash directly, it's part of the main payload
         }
         return msg;
     }
@@ -384,5 +392,210 @@ TEST_F(AdvancedProducerTableTest, IsRedisConnected) {
 // - Config loading affecting default delivery mode (requires ConfigDBConnector setup)
 // - waitForAck with empty correlation ID (already handled by check in method)
 // - waitForAck when m_ack_db_connector is null (e.g. pipeline constructor without separate ACK DB)
+
+TEST_F(AdvancedProducerTableTest, RegisterAndReceiveAsyncAckAllAcked) {
+    std::string corr_id = "async_all_acked_corr1";
+    m_producer->setDeliveryMode(DeliveryMode::AT_LEAST_ONCE);
+    std::vector<FieldValueTuple> fv;
+    fv.emplace_back("field", "async_val1");
+    m_producer->set("key_async1", fv, 5, corr_id);
+    m_producer->flushPriorityQueue(); // This creates MSG_STATUS, CORR_IDS, PENDING_MSG_TS, CORR_META
+
+    // Register for async ACK
+    m_producer->registerCorrelationForAsyncAck(corr_id);
+
+    // Simulate Consumer processing and publishing notification
+    // 1. Get message ID (e.g., from PENDING_MESSAGES_BY_TIME_KEY)
+    RedisCommand zrangeCmd;
+    zrangeCmd.format("ZRANGE %s 0 0", m_pendingMessagesKey.c_str());
+    RedisReply rZrange(m_stateDb.get(), zrangeCmd, true);
+    auto ids = rZrange.getArray();
+    ASSERT_EQ(ids.size(), 1);
+    std::string msg_id = ids[0]->getReply<std::string>();
+
+    // 2. Consumer ACKs the message
+    std::string status_key = m_ackStatusPrefix + msg_id;
+    RedisCommand hsetCmd;
+    hsetCmd.format("HSET %s %s ACKED", status_key.c_str(), Message::MSG_STAT_FIELD_STATUS.c_str());
+    RedisReply rHset(m_stateDb.get(), hsetCmd, false);
+    hsetCmd.format("HSET %s %s %lld", status_key.c_str(), Message::MSG_STAT_FIELD_TIMESTAMP.c_str(), std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+    rHset.setContext(m_stateDb.get(), hsetCmd, false);
+
+    RedisCommand zremCmd;
+    zremCmd.format("ZREM %s %s", m_pendingMessagesKey.c_str(), msg_id.c_str());
+    RedisReply rZrem(m_stateDb.get(), zremCmd, false);
+
+    std::string corr_ids_key = m_ackCorrIdsPrefix + corr_id;
+    RedisCommand sremCmd;
+    sremCmd.format("SREM %s %s", corr_ids_key.c_str(), msg_id.c_str());
+    RedisReply rSrem(m_stateDb.get(), sremCmd, false);
+
+    // 3. Consumer updates CORR_META and publishes notification
+    std::string corr_meta_key = std::string(AsyncAck::CORRELATION_META_PREFIX) + corr_id;
+    RedisCommand hincrbyCmd;
+    hincrbyCmd.format("HINCRBY %s %s 1", corr_meta_key.c_str(), AsyncAck::FIELD_PROCESSED_MSG_COUNT.c_str());
+    RedisReply rHincr(m_stateDb.get(), hincrbyCmd, false);
+    long long processed_count = rHincr.getReply<long long>();
+
+    // Assuming total_msg_count was set to 1 by producer's flush
+    if (processed_count >= 1) { // Simplified check for single message
+        Json notification_payload = Json::object();
+        notification_payload[AsyncAck::FIELD_CORRELATION_ID] = corr_id;
+        notification_payload[AsyncAck::FIELD_STATUS] = AsyncAck::STATUS_ALL_ACKED;
+        notification_payload[AsyncAck::FIELD_REASON] = "";
+
+        std::string notify_channel = std::string(AsyncAck::NOTIFICATION_CHANNEL_PREFIX) + corr_id;
+        RedisCommand publishCmd;
+        publishCmd.format("PUBLISH %s %s", notify_channel.c_str(), notification_payload.dump().c_str());
+        RedisReply rPublish(m_stateDb.get(), publishCmd, false);
+
+        // Consumer would also clean up CORR_META and CORR_IDS keys
+        RedisCommand delCmd;
+        delCmd.format("DEL %s %s", corr_meta_key.c_str(), corr_ids_key.c_str());
+        RedisReply rDelMeta(m_stateDb.get(), delCmd, false);
+    }
+
+    // 4. Producer (test) waits for notification via Select
+    swss::Select s;
+    s.addSelectable(m_producer.get());
+    int select_fd_count = 0;
+    int ret = s.select(&select_fd_count, 1000); // 1s timeout
+
+    ASSERT_GT(ret, 0); // Should have activity
+    ASSERT_GT(select_fd_count, 0);
+    EXPECT_TRUE(m_producer->isSet(s));
+
+    m_producer->processAsyncAckNotifications(); // This should read the pub/sub message
+
+    auto result = m_producer->getAsyncAckResult(corr_id);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->status, GroupAckStatus::ALL_ACKED);
+}
+
+TEST_F(AdvancedProducerTableTest, RegisterAndReceiveAsyncAckGroupNacked) {
+    std::string corr_id = "async_group_nack_corr1";
+    m_producer->setDeliveryMode(DeliveryMode::AT_LEAST_ONCE);
+    std::vector<FieldValueTuple> fv;
+    fv.emplace_back("field", "async_val_nack");
+    m_producer->set("key_async_nack", fv, 5, corr_id);
+    m_producer->flushPriorityQueue();
+
+    m_producer->registerCorrelationForAsyncAck(corr_id);
+
+    // Simulate Consumer NACKing and publishing notification
+    RedisCommand zrangeCmd;
+    zrangeCmd.format("ZRANGE %s 0 0", m_pendingMessagesKey.c_str());
+    RedisReply rZrange(m_stateDb.get(), zrangeCmd, true);
+    auto ids = rZrange.getArray();
+    ASSERT_EQ(ids.size(), 1);
+    std::string msg_id = ids[0]->getReply<std::string>();
+
+    std::string status_key = m_ackStatusPrefix + msg_id;
+    RedisCommand hsetCmd;
+    hsetCmd.format("HSET %s %s NACKED %s %s", status_key.c_str(),
+                   Message::MSG_STAT_FIELD_STATUS.c_str(),
+                   "nack_reason", "TestNackReason");
+    RedisReply rHset(m_stateDb.get(), hsetCmd, false);
+
+    // Simulate consumer's checkAndPublishCorrelationCompletion logic for terminal NACK
+    std::string corr_meta_key = std::string(AsyncAck::CORRELATION_META_PREFIX) + corr_id;
+    RedisCommand hincrbyCmd; // Increment processed
+    hincrbyCmd.format("HINCRBY %s %s 1", corr_meta_key.c_str(), AsyncAck::FIELD_PROCESSED_MSG_COUNT.c_str());
+    RedisReply rHincr(m_stateDb.get(), hincrbyCmd, false);
+    RedisCommand hsetMetaCmd; // Set NACK flag
+    hsetMetaCmd.format("HSET %s %s 1", corr_meta_key.c_str(), AsyncAck::FIELD_NACK_RECEIVED_FLAG.c_str());
+    RedisReply rHsetMeta(m_stateDb.get(), hsetMetaCmd, false);
+
+
+    Json notification_payload = Json::object();
+    notification_payload[AsyncAck::FIELD_CORRELATION_ID] = corr_id;
+    notification_payload[AsyncAck::FIELD_STATUS] = AsyncAck::STATUS_GROUP_NACKED;
+    notification_payload[AsyncAck::FIELD_REASON] = "TestNackReason";
+
+    std::string notify_channel = std::string(AsyncAck::NOTIFICATION_CHANNEL_PREFIX) + corr_id;
+    RedisCommand publishCmd;
+    publishCmd.format("PUBLISH %s %s", notify_channel.c_str(), notification_payload.dump().c_str());
+    RedisReply rPublish(m_stateDb.get(), publishCmd, false);
+
+    // Consumer would also clean up CORR_META and CORR_IDS keys
+    std::string corr_ids_key = m_ackCorrIdsPrefix + corr_id;
+    RedisCommand delCmd;
+    delCmd.format("DEL %s %s %s", corr_meta_key.c_str(), corr_ids_key.c_str(), m_pendingMessagesKey.c_str()); // Also clear pending set
+    RedisReply rDelMeta(m_stateDb.get(), delCmd, false);
+
+
+    swss::Select s;
+    s.addSelectable(m_producer.get());
+    int select_fd_count = 0;
+    int ret = s.select(&select_fd_count, 1000);
+
+    ASSERT_GT(ret, 0);
+    ASSERT_GT(select_fd_count, 0);
+    EXPECT_TRUE(m_producer->isSet(s));
+
+    m_producer->processAsyncAckNotifications();
+
+    auto result = m_producer->getAsyncAckResult(corr_id);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->status, GroupAckStatus::GROUP_NACKED);
+    EXPECT_EQ(result->nack_reason, "TestNackReason");
+}
+
+TEST_F(AdvancedProducerTableTest, GetAsyncAckResultWithoutNotificationYet) {
+    std::string corr_id = "async_no_notify_yet";
+    m_producer->registerCorrelationForAsyncAck(corr_id);
+    auto result = m_producer->getAsyncAckResult(corr_id, false); // remove_on_get = false
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(AdvancedProducerTableTest, AsyncAckWithBlockingWaitForAckRefactor) {
+    // This test assumes waitForAck is now internally using the async mechanism.
+    // Its external behavior should remain the same.
+    m_producer->setDeliveryMode(DeliveryMode::AT_LEAST_ONCE);
+    std::string corr_id = "wait_uses_async";
+    std::vector<FieldValueTuple> fv;
+    fv.emplace_back("f", "v_wait_async");
+    m_producer->set("key_wait_async", fv, 5, corr_id);
+    m_producer->flushPriorityQueue();
+
+    RedisCommand zrangeCmd;
+    zrangeCmd.format("ZRANGE %s 0 0", m_pendingMessagesKey.c_str());
+    RedisReply rZrange(m_stateDb.get(), zrangeCmd, true);
+    auto ids = rZrange.getArray();
+    ASSERT_EQ(ids.size(), 1);
+    std::string msg_id = ids[0]->getReply<std::string>();
+
+    // Simulate Consumer processing and publishing notification
+    std::string status_key = m_ackStatusPrefix + msg_id;
+    RedisCommand hsetCmd;
+    hsetCmd.format("HSET %s %s ACKED", status_key.c_str(), Message::MSG_STAT_FIELD_STATUS.c_str());
+    RedisReply rHset(m_stateDb.get(), hsetCmd, false);
+
+    std::string corr_meta_key = std::string(AsyncAck::CORRELATION_META_PREFIX) + corr_id;
+    RedisCommand hincrbyCmd;
+    hincrbyCmd.format("HINCRBY %s %s 1", corr_meta_key.c_str(), AsyncAck::FIELD_PROCESSED_MSG_COUNT.c_str());
+    RedisReply rHincr(m_stateDb.get(), hincrbyCmd, false);
+
+    Json notification_payload = Json::object();
+    notification_payload[AsyncAck::FIELD_CORRELATION_ID] = corr_id;
+    notification_payload[AsyncAck::FIELD_STATUS] = AsyncAck::STATUS_ALL_ACKED;
+    notification_payload[AsyncAck::FIELD_REASON] = "";
+
+    std::string notify_channel = std::string(AsyncAck::NOTIFICATION_CHANNEL_PREFIX) + corr_id;
+    RedisCommand publishCmd;
+    publishCmd.format("PUBLISH %s %s", notify_channel.c_str(), notification_payload.dump().c_str());
+    RedisReply rPublish(m_stateDb.get(), publishCmd, false);
+
+    // Consumer would also clean up CORR_META and CORR_IDS keys
+    std::string corr_ids_key = m_ackCorrIdsPrefix + corr_id;
+    RedisCommand delCmd;
+    delCmd.format("DEL %s %s %s", corr_meta_key.c_str(), corr_ids_key.c_str(), m_pendingMessagesKey.c_str()); // Also clear pending set for msg_id
+    RedisReply rDelMeta(m_stateDb.get(), delCmd, false);
+
+
+    bool result = m_producer->waitForAck(corr_id, 2000); // Increased timeout for pub/sub
+    EXPECT_TRUE(result);
+}
+
 
 ```

@@ -54,13 +54,13 @@ std::string generate_unique_message_id() {
 
 // Constructors
 AdvancedProducerTable::AdvancedProducerTable(DBConnector* db, const std::string& tableName, swss::ConfigDBConnector* configDb)
-    : ProducerTable(db, tableName), m_db(db), m_ack_db_connector(db) {
-    // m_config is default-initialized by its own default constructor.
+    : ProducerTable(db, tableName), Selectable(0), m_db(db), m_ack_db_connector(db) { // Call Selectable constructor
+    m_ack_notifier_select = std::make_unique<swss::RedisSelect>();
     if (configDb) {
         swss::loadPubSubConfig(configDb, getTableName(), m_config);
     }
-    m_delivery_mode = m_config.delivery_mode_enum; // Set default delivery mode from config
-    if (m_db) { // m_counters_table requires a valid DBConnector
+    m_delivery_mode = m_config.delivery_mode_enum;
+    if (m_db) {
         m_counters_table = std::make_unique<swss::CountersTable>(m_db, swss::PubSubCounters::COUNTERS_TABLE_NAME);
         m_counters_producer_queue_depth_key = swss::PubSubCounters::producer_queue_depth(getTableName());
     } else {
@@ -71,15 +71,15 @@ AdvancedProducerTable::AdvancedProducerTable(DBConnector* db, const std::string&
 }
 
 AdvancedProducerTable::AdvancedProducerTable(RedisPipeline* pipeline, const std::string& tableName, bool buffered, swss::ConfigDBConnector* configDb)
-    : ProducerTable(pipeline, tableName, buffered), m_db(nullptr), m_ack_db_connector(nullptr) {
+    : ProducerTable(pipeline, tableName, buffered), Selectable(0), m_db(nullptr), m_ack_db_connector(nullptr) { // Call Selectable constructor
+    m_ack_notifier_select = std::make_unique<swss::RedisSelect>();
     if (configDb) {
         swss::loadPubSubConfig(configDb, getTableName(), m_config);
     }
     m_delivery_mode = m_config.delivery_mode_enum;
     if (m_ack_db_connector == nullptr) {
-        SWSS_LOG_WARN("AdvancedProducerTable for table '%s' initialized with RedisPipeline, ACK tracking will be disabled.", tableName.c_str());
+        SWSS_LOG_WARN("AdvancedProducerTable for table '%s' initialized with RedisPipeline, ACK tracking will be disabled for Redis operations.", tableName.c_str());
     }
-    // Counters are disabled if m_db is null (which it is with pipeline constructor)
     if (!m_db) {
         SWSS_LOG_WARN("AdvancedProducerTable for table '%s' (pipeline): DBConnector is null, PubSub counters will be disabled.", getTableName().c_str());
     }
@@ -89,8 +89,20 @@ AdvancedProducerTable::AdvancedProducerTable(RedisPipeline* pipeline, const std:
 
 // Destructor
 AdvancedProducerTable::~AdvancedProducerTable() {
-    // Future: Ensure any pending messages in m_priority_queue are flushed or handled
-    // if required by the delivery mode guarantees. For now, default behavior is fine.
+    std::lock_guard<std::mutex> lock(m_async_ack_mutex);
+    std::vector<std::string> ids_to_unregister;
+    for(const auto& corr_id : m_pending_async_corr_ids) {
+        ids_to_unregister.push_back(corr_id);
+    }
+    // Unlock before calling unregister to avoid re-locking mutex if called from same thread (though unlikely here)
+    // However, unregisterCorrelationForAsyncAck itself locks, so this is fine.
+    // The main concern is modifying m_pending_async_corr_ids while iterating.
+    lock.~lock_guard(); // Explicitly unlock if needed before next calls, or copy IDs first.
+
+    for(const auto& corr_id : ids_to_unregister) {
+        unregisterCorrelationForAsyncAck(corr_id, false); // Don't force remove results, just unsubscribe
+    }
+    // m_ack_notifier_select will be cleaned up by unique_ptr
 }
 
 // New set method
@@ -266,30 +278,223 @@ bool AdvancedProducerTable::waitForAck(const std::string& correlation_id, int ti
         std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Configurable poll interval
     }
     // Should not be reached due to timeout check at the beginning of the loop.
+    SWSS_LOG_DEBUG("waitForAck for corr_id '%s' on table %s: Loop terminated unexpectedly or due to overall timeout.",
+                   correlation_id.c_str(), getTableName().c_str());
+    unregisterCorrelationForAsyncAck(correlation_id, true); // Force cleanup on unexpected exit or timeout
     return false;
 }
 
 bool AdvancedProducerTable::isRedisConnected() const {
-    if (!m_db || !m_db->getRedisContext()) {
-        SWSS_LOG_ERROR("Redis context not available for PING.");
+    // Use m_ack_db_connector for PING if available and used for ACK writes, otherwise m_db.
+    // If both are null (e.g. pipeline only constructor and no separate ACK DB), cannot ping.
+    DBConnector* ping_db = m_ack_db_connector ? m_ack_db_connector : m_db.get();
+
+    if (!ping_db || !ping_db->getRedisContext() || !ping_db->getRedisContext()->getContext()) {
+        SWSS_LOG_ERROR("Redis context not available for PING on table %s.", getTableName().c_str());
         return false;
     }
-    redisReply *reply = static_cast<redisReply *>(redisCommand(m_db->getRedisContext()->getContext(), "PING"));
+    redisReply *reply = static_cast<redisReply *>(redisCommand(ping_db->getRedisContext()->getContext(), "PING"));
     if (reply == nullptr) {
-        if (m_db->getRedisContext()->getContext() && m_db->getRedisContext()->getContext()->err) {
-            SWSS_LOG_ERROR("Redis PING command failed: %s", m_db->getRedisContext()->getContext()->errstr);
+        if (ping_db->getRedisContext()->getContext()->err) {
+            SWSS_LOG_ERROR("Redis PING command failed for table %s: %s", getTableName().c_str(), ping_db->getRedisContext()->getContext()->errstr);
         } else {
-            SWSS_LOG_ERROR("Redis PING command failed (reply is null), possibly disconnected.");
+            SWSS_LOG_ERROR("Redis PING command failed for table %s (reply is null), possibly disconnected.", getTableName().c_str());
         }
         return false;
     }
     bool is_ok = (reply->type == REDIS_REPLY_STATUS && strcmp(reply->str, "PONG") == 0);
     freeReplyObject(reply);
     if (!is_ok) {
-        SWSS_LOG_WARN("Redis PING did not return PONG.");
+        SWSS_LOG_WARN("Redis PING did not return PONG for table %s.", getTableName().c_str());
     }
     return is_ok;
 }
+
+
+void AdvancedProducerTable::registerCorrelationForAsyncAck(const std::string& correlation_id) {
+    if (correlation_id.empty()) {
+        SWSS_LOG_ERROR("Cannot register empty correlation_id for async ACK on table %s.", getTableName().c_str());
+        return;
+    }
+    if (!m_ack_db_connector) {
+        SWSS_LOG_ERROR("ACK DB connector not available for table %s. Cannot register async ACK for corr_id %s.",
+                       getTableName().c_str(), correlation_id.c_str());
+        return;
+    }
+    if (!m_ack_notifier_select) {
+         SWSS_LOG_ERROR("ACK notifier select not initialized for table %s. Cannot register async ACK for corr_id %s.",
+                       getTableName().c_str(), correlation_id.c_str());
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(m_async_ack_mutex);
+    if (m_pending_async_corr_ids.count(correlation_id)) {
+        SWSS_LOG_DEBUG("Correlation_id %s already registered for async ACK on table %s.",
+                       correlation_id.c_str(), getTableName().c_str());
+        return;
+    }
+
+    std::string channel_name = std::string(AsyncAck::NOTIFICATION_CHANNEL_PREFIX) + correlation_id;
+    m_ack_notifier_select->subscribe(m_ack_db_connector, channel_name);
+    m_pending_async_corr_ids.insert(correlation_id);
+    SWSS_LOG_INFO("Registered correlation_id %s for async ACK on table %s, subscribed to channel %s.",
+                  correlation_id.c_str(), getTableName().c_str(), channel_name.c_str());
+}
+
+void AdvancedProducerTable::unregisterCorrelationForAsyncAck(const std::string& correlation_id, bool force_remove_result) {
+    if (correlation_id.empty()) {
+        SWSS_LOG_ERROR("Cannot unregister empty correlation_id for async ACK on table %s.", getTableName().c_str());
+        return;
+    }
+     if (!m_ack_notifier_select) { // Check if select object is valid
+        SWSS_LOG_WARN("ACK notifier select not initialized for table %s. Cannot unregister async ACK for corr_id %s.",
+                       getTableName().c_str(), correlation_id.c_str());
+        // Still attempt to clean up maps if needed
+    }
+
+    std::lock_guard<std::mutex> lock(m_async_ack_mutex);
+    std::string channel_name = std::string(AsyncAck::NOTIFICATION_CHANNEL_PREFIX) + correlation_id;
+
+    if (m_ack_notifier_select) { // Only unsubscribe if select object is valid
+        m_ack_notifier_select->unsubscribe(channel_name);
+    }
+
+    m_pending_async_corr_ids.erase(correlation_id);
+    if (force_remove_result) {
+        m_async_ack_results.erase(correlation_id);
+    }
+    SWSS_LOG_INFO("Unregistered correlation_id %s from async ACK on table %s, unsubscribed from channel %s. Force remove result: %s",
+                  correlation_id.c_str(), getTableName().c_str(), channel_name.c_str(), force_remove_result ? "true" : "false");
+}
+
+std::optional<FinalAckResult> AdvancedProducerTable::getAsyncAckResult(const std::string& correlation_id, bool remove_on_get) {
+    std::lock_guard<std::mutex> lock(m_async_ack_mutex);
+    auto it = m_async_ack_results.find(correlation_id);
+    if (it != m_async_ack_results.end()) {
+        FinalAckResult result = it->second;
+        if (remove_on_get) {
+            m_async_ack_results.erase(it);
+            // Unsubscribing is now handled by processAsyncAckNotifications when a final status is received,
+            // or by unregisterCorrelationForAsyncAck if called explicitly.
+            // No need to directly call unsubscribe here if this is just for polling results.
+            // If this get marks the end of interest regardless of result, then unregister.
+            // For now, assume unsubscription is handled when the *final* notification is processed
+            // or if waitForAck times out/completes.
+             SWSS_LOG_INFO("Retrieved async ACK result for corr_id %s on table %s. Removed from results map: %s.",
+                           correlation_id.c_str(), getTableName().c_str(), remove_on_get ? "true" : "false");
+        }
+        return result;
+    }
+    return std::nullopt;
+}
+
+void AdvancedProducerTable::processAsyncAckNotifications() {
+    if (!m_ack_notifier_select) {
+        SWSS_LOG_DEBUG("ACK notifier select not initialized for table %s. Cannot process async notifications.", getTableName().c_str());
+        return;
+    }
+
+    std::string channel_name;
+    std::string message_content;
+    int db_id; // Not directly used from RedisSelect pop for pubsub
+
+    // Loop based on RedisSelect's internal queue, not hasData to avoid race conditions if called rapidly
+    while (m_ack_notifier_select->pop(channel_name, message_content, db_id)) {
+        SWSS_LOG_DEBUG("Processing async ACK notification from channel '%s' for table %s: %s",
+                       channel_name.c_str(), getTableName().c_str(), message_content.c_str());
+
+        std::string expected_prefix = AsyncAck::NOTIFICATION_CHANNEL_PREFIX;
+        std::string rcvd_corr_id;
+
+        if (channel_name.rfind(expected_prefix, 0) == 0) {
+            rcvd_corr_id = channel_name.substr(expected_prefix.length());
+        } else {
+            SWSS_LOG_ERROR("Received async ACK on unexpected channel '%s' for table %s.", channel_name.c_str(), getTableName().c_str());
+            continue;
+        }
+
+        if (rcvd_corr_id.empty()) {
+            SWSS_LOG_ERROR("Extracted empty correlation_id from channel '%s' for table %s.", channel_name.c_str(), getTableName().c_str());
+            continue;
+        }
+
+        Json notification_json;
+        std::string status_str;
+        std::string reason_str;
+
+        try {
+            notification_json = Json::parse(message_content);
+            if (notification_json.count(AsyncAck::FIELD_STATUS)) {
+                notification_json.at(AsyncAck::FIELD_STATUS).get_to(status_str);
+            }
+            if (notification_json.count(AsyncAck::FIELD_REASON)) {
+                notification_json.at(AsyncAck::FIELD_REASON).get_to(reason_str);
+            }
+        } catch (const std::exception& e) {
+            SWSS_LOG_ERROR("Failed to parse async ACK notification JSON for corr_id %s, table %s: %s. JSON: %s",
+                           rcvd_corr_id.c_str(), getTableName().c_str(), e.what(), message_content.c_str());
+            continue;
+        }
+
+        GroupAckStatus status_enum = GroupAckStatus::PENDING; // Default
+        if (status_str == AsyncAck::STATUS_ALL_ACKED) {
+            status_enum = GroupAckStatus::ALL_ACKED;
+        } else if (status_str == AsyncAck::STATUS_GROUP_NACKED) {
+            status_enum = GroupAckStatus::GROUP_NACKED;
+        } else {
+            SWSS_LOG_ERROR("Received unknown status '%s' in async ACK for corr_id %s, table %s.",
+                           status_str.c_str(), rcvd_corr_id.c_str(), getTableName().c_str());
+            // Keep it PENDING or treat as error? For now, store with reason.
+            reason_str = "Unknown status in notification: " + status_str + "; " + reason_str;
+        }
+
+        SWSS_LOG_INFO("Async ACK result for corr_id %s on table %s: Status=%s, Reason=%s. Storing result.",
+                      rcvd_corr_id.c_str(), getTableName().c_str(), status_str.c_str(), reason_str.c_str());
+
+        std::lock_guard<std::mutex> lock(m_async_ack_mutex);
+        m_async_ack_results[rcvd_corr_id] = FinalAckResult(status_enum, reason_str);
+        m_pending_async_corr_ids.erase(rcvd_corr_id); // Final status received
+        // Automatically unsubscribe as the final status for this correlation ID is known
+        m_ack_notifier_select->unsubscribe(channel_name);
+    }
+}
+
+// Selectable interface implementations
+int AdvancedProducerTable::getFd() {
+    return m_ack_notifier_select ? m_ack_notifier_select->getFd() : -1;
+}
+
+bool AdvancedProducerTable::hasData() {
+    // Check if there are any results ready to be picked up by getAsyncAckResult
+    // Or if RedisSelect itself has unprocessed pub/sub messages.
+    // For simplicity, if RedisSelect has data, it means something to process.
+    return m_ack_notifier_select ? m_ack_notifier_select->hasData() : false;
+}
+
+bool AdvancedProducerTable::hasCachedData() {
+    return hasData(); // Same logic for this implementation
+}
+
+uint64_t AdvancedProducerTable::readData() {
+    processAsyncAckNotifications();
+    return 0; // Return value might not be significant here
+}
+
+void AdvancedProducerTable::updateAfterRead() {
+    // RedisSelect::pop in processAsyncAckNotifications handles clearing its internal state.
+    // If RedisSelect used an eventfd internally that needed manual clearing, it would go here.
+    // For now, this can be a no-op if processAsyncAckNotifications does all the work.
+    if (m_ack_notifier_select) {
+        // m_ack_notifier_select->updateAfterRead(); // If RedisSelect had such a method
+    }
+}
+
+bool AdvancedProducerTable::initializedWithData() {
+    // Async ACKs are typically not present on initialization unless app restarted with pending ACKs
+    // and somehow RedisSelect picked them up immediately.
+    return false;
+}
+
 
 // Flushes messages from the priority queue to Redis
 void AdvancedProducerTable::flushPriorityQueue() {

@@ -258,9 +258,34 @@ private:
     bool reconstructMessageFromStatus(const std::string& message_id, common::Message& message);
 
     // DLQ Management
-    /** @brief (Placeholder) Trims old messages from the Dead Letter Queue based on retention policy. */
+    /**
+     * @brief Trims old messages from the Dead Letter Queue (DLQ).
+     * @details This method is intended to remove messages from the DLQ that are older than
+     *          the configured `dead_letter_retention_hours`.
+     * @warning The current implementation is a placeholder. Due to the DLQ storing messages
+     *          as individual hashes (keyed by message ID), efficient, timestamp-based trimming
+     *          is complex and requires iterating over many keys (e.g., using SCAN) or an
+     *          auxiliary sorted set for DLQ message timestamps. A production-ready implementation
+     *          might require a different DLQ storage structure (e.g., a Redis List or Sorted Set
+     *          for the DLQ itself) for performant trimming.
+     */
     void trimDeadLetterQueue();
-    /** @brief (Placeholder) Pops messages from DLQ for potential replay. */
+
+    /**
+     * @brief Pops a specified number of messages from the Dead Letter Queue (DLQ) for replay.
+     * @param count The maximum number of messages to attempt to pop and prepare for replay. Defaults to 1.
+     * @return std::vector<common::Message> A vector of `common::Message` objects.
+     *         These messages have their DLQ-specific fields cleared (`dlq_reason`, `dlq_timestamp_ms`, `last_nack_error_message`)
+     *         and `retry_count` reset to 0, making them suitable for re-production.
+     *         The original message `id` is retained for traceability; the producer should generate a new ID upon re-sending.
+     * @warning The current implementation is a placeholder. It does not guarantee fetching the oldest
+     *          messages first or efficiently locating messages in the HASH-per-message DLQ structure.
+     *          It currently returns an empty vector. A robust implementation would require a
+     *          different DLQ structure or a mechanism to list/sort DLQ entries by age.
+     * @note Messages returned by this function are intended to be *removed* from the DLQ.
+     *       If the replay attempt by the application fails, the application is responsible for
+     *       handling the message further (e.g., re-sending to DLQ with a new reason).
+     */
     std::vector<common::Message> popMessagesForReplay(size_t count = 1);
 };
 

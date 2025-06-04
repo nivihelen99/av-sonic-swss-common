@@ -317,4 +317,181 @@ TEST_F(AdvancedConsumerTableTest, SelectableNotification) {
 // - popMessagesForReplay (once DLQ is list-based and replay is implemented, or with HASH based scan)
 // - Config loading effects on ack_timeout_ms, max_retries etc.
 
+
+TEST_F(AdvancedConsumerTableTest, PublishNotificationOnAllAcked) {
+    std::string corr_id = "async_consume_all_ack";
+    m_consumer->enableManualAck(true);
+
+    // Producer sets up CORR_META
+    std::string corr_meta_key = std::string(AsyncAck::CORRELATION_META_PREFIX) + corr_id;
+    std::vector<std::pair<std::string, std::string>> meta_fields;
+    meta_fields.emplace_back(AsyncAck::FIELD_TOTAL_MSG_COUNT, "2");
+    meta_fields.emplace_back(AsyncAck::FIELD_PROCESSED_MSG_COUNT, "0");
+    meta_fields.emplace_back(AsyncAck::FIELD_NACK_RECEIVED_FLAG, "0");
+    m_stateDb->getRedisContext()->hmset(corr_meta_key, meta_fields.begin(), meta_fields.end());
+    m_stateDb->getRedisContext()->expire(corr_meta_key, 300);
+
+
+    produce_message(*m_producer, "key_async_c1", 5, "v1", corr_id, DeliveryMode::AT_LEAST_ONCE);
+    produce_message(*m_producer, "key_async_c2", 5, "v2", corr_id, DeliveryMode::AT_LEAST_ONCE);
+
+    // Test subscribes to the notification channel
+    DBConnector sub_db(STATE_DB, "localhost", 6379, 0); // Use STATE_DB where ACKs are managed
+    RedisSelect notifier_select;
+    std::string notify_channel = std::string(AsyncAck::NOTIFICATION_CHANNEL_PREFIX) + corr_id;
+    notifier_select.subscribe(&sub_db, notify_channel);
+
+    Select s;
+    s.addSelectable(&notifier_select);
+
+    std::deque<Message> messages;
+    m_consumer->pops(messages, 1); // Pop first message
+    ASSERT_EQ(messages.size(), 1);
+    m_consumer->ack(messages[0].id); // ACK first message
+    SWSS_LOG_NOTICE("ACKed first message %s", messages[0].id.c_str());
+
+
+    // Notification should not be sent yet
+    int select_fd_count = 0;
+    int ret = s.select(&select_fd_count, 100); // Short timeout
+    EXPECT_EQ(ret, Select::TIMEOUT);
+
+    m_consumer->pops(messages, 1); // Pop second message
+    ASSERT_EQ(messages.size(), 1);
+    m_consumer->ack(messages[0].id); // ACK second message - this should trigger notification
+    SWSS_LOG_NOTICE("ACKed second message %s", messages[0].id.c_str());
+
+
+    // Notification should be sent now
+    ret = s.select(&select_fd_count, 1000); // Longer timeout for pub/sub
+    ASSERT_EQ(ret, Select::OBJECT) << "Select timed out waiting for ACK notification";
+    ASSERT_GT(select_fd_count, 0);
+    EXPECT_TRUE(notifier_select.isSet(s));
+
+    std::string rcvd_channel, rcvd_message;
+    int db_id;
+    notifier_select.pop(rcvd_channel, rcvd_message, db_id);
+
+    EXPECT_EQ(rcvd_channel, notify_channel);
+    Json notify_json = Json::parse(rcvd_message);
+    EXPECT_EQ(notify_json[AsyncAck::FIELD_CORRELATION_ID].get<std::string>(), corr_id);
+    EXPECT_EQ(notify_json[AsyncAck::FIELD_STATUS].get<std::string>(), AsyncAck::STATUS_ALL_ACKED);
+
+    // Verify CORR_META and CORR_IDS keys are cleaned up
+    EXPECT_FALSE(m_stateDb->getRedisContext()->exists({corr_meta_key})[0]);
+    EXPECT_FALSE(m_stateDb->getRedisContext()->exists({std::string(Message::CORRELATION_IDS_PREFIX) + corr_id})[0]);
+
+    notifier_select.unsubscribe(&sub_db, notify_channel);
+}
+
+TEST_F(AdvancedConsumerTableTest, PublishNotificationOnGroupNacked) {
+    std::string corr_id = "async_consume_group_nack";
+    m_consumer->enableManualAck(true);
+
+    std::string corr_meta_key = std::string(AsyncAck::CORRELATION_META_PREFIX) + corr_id;
+    std::vector<std::pair<std::string, std::string>> meta_fields;
+    meta_fields.emplace_back(AsyncAck::FIELD_TOTAL_MSG_COUNT, "2");
+    meta_fields.emplace_back(AsyncAck::FIELD_PROCESSED_MSG_COUNT, "0");
+    meta_fields.emplace_back(AsyncAck::FIELD_NACK_RECEIVED_FLAG, "0");
+    m_stateDb->getRedisContext()->hmset(corr_meta_key, meta_fields.begin(), meta_fields.end());
+    m_stateDb->getRedisContext()->expire(corr_meta_key, 300);
+
+    produce_message(*m_producer, "key_async_n1", 5, "v1", corr_id, DeliveryMode::AT_LEAST_ONCE);
+    produce_message(*m_producer, "key_async_n2", 5, "v2", corr_id, DeliveryMode::AT_LEAST_ONCE);
+
+    DBConnector sub_db(STATE_DB, "localhost", 6379, 0);
+    RedisSelect notifier_select;
+    std::string notify_channel = std::string(AsyncAck::NOTIFICATION_CHANNEL_PREFIX) + corr_id;
+    notifier_select.subscribe(&sub_db, notify_channel);
+    Select s;
+    s.addSelectable(&notifier_select);
+
+    std::deque<Message> messages;
+    m_consumer->pops(messages, 1); // Pop first message
+    ASSERT_EQ(messages.size(), 1);
+    m_consumer->ack(messages[0].id); // ACK first message
+    SWSS_LOG_NOTICE("ACKed first message %s", messages[0].id.c_str());
+
+
+    int select_fd_count = 0;
+    int ret = s.select(&select_fd_count, 100);
+    EXPECT_EQ(ret, Select::TIMEOUT); // No notification yet
+
+    m_consumer->pops(messages, 1); // Pop second message
+    ASSERT_EQ(messages.size(), 1);
+    std::string nack_reason = "NACK test reason";
+    m_consumer->nack(messages[0].id, false, nack_reason); // Terminally NACK second message
+    SWSS_LOG_NOTICE("NACKed second message %s", messages[0].id.c_str());
+
+
+    ret = s.select(&select_fd_count, 1000);
+    ASSERT_EQ(ret, Select::OBJECT) << "Select timed out waiting for GROUP_NACKED notification";
+    ASSERT_GT(select_fd_count, 0);
+    EXPECT_TRUE(notifier_select.isSet(s));
+
+    std::string rcvd_channel, rcvd_message;
+    int db_id;
+    notifier_select.pop(rcvd_channel, rcvd_message, db_id);
+
+    EXPECT_EQ(rcvd_channel, notify_channel);
+    Json notify_json = Json::parse(rcvd_message);
+    EXPECT_EQ(notify_json[AsyncAck::FIELD_CORRELATION_ID].get<std::string>(), corr_id);
+    EXPECT_EQ(notify_json[AsyncAck::FIELD_STATUS].get<std::string>(), AsyncAck::STATUS_GROUP_NACKED);
+    EXPECT_EQ(notify_json[AsyncAck::FIELD_REASON].get<std::string>(), nack_reason);
+
+    EXPECT_FALSE(m_stateDb->getRedisContext()->exists({corr_meta_key})[0]);
+    EXPECT_FALSE(m_stateDb->getRedisContext()->exists({std::string(Message::CORRELATION_IDS_PREFIX) + corr_id})[0]);
+
+    notifier_select.unsubscribe(&sub_db, notify_channel);
+}
+
+TEST_F(AdvancedConsumerTableTest, NoNotificationIfGroupRequeued) {
+    std::string corr_id = "async_consume_requeue";
+    m_consumer->enableManualAck(true);
+
+    std::string corr_meta_key = std::string(AsyncAck::CORRELATION_META_PREFIX) + corr_id;
+    std::vector<std::pair<std::string, std::string>> meta_fields;
+    meta_fields.emplace_back(AsyncAck::FIELD_TOTAL_MSG_COUNT, "2");
+    meta_fields.emplace_back(AsyncAck::FIELD_PROCESSED_MSG_COUNT, "0");
+    meta_fields.emplace_back(AsyncAck::FIELD_NACK_RECEIVED_FLAG, "0");
+    m_stateDb->getRedisContext()->hmset(corr_meta_key, meta_fields.begin(), meta_fields.end());
+    m_stateDb->getRedisContext()->expire(corr_meta_key, 300);
+
+    produce_message(*m_producer, "key_async_r1", 5, "v1", corr_id, DeliveryMode::AT_LEAST_ONCE);
+    produce_message(*m_producer, "key_async_r2", 5, "v2", corr_id, DeliveryMode::AT_LEAST_ONCE);
+
+    DBConnector sub_db(STATE_DB, "localhost", 6379, 0);
+    RedisSelect notifier_select;
+    std::string notify_channel = std::string(AsyncAck::NOTIFICATION_CHANNEL_PREFIX) + corr_id;
+    notifier_select.subscribe(&sub_db, notify_channel);
+    Select s;
+    s.addSelectable(&notifier_select);
+
+    std::deque<Message> messages;
+    m_consumer->pops(messages, 1);
+    ASSERT_EQ(messages.size(), 1);
+    m_consumer->ack(messages[0].id);
+    SWSS_LOG_NOTICE("ACKed first message %s", messages[0].id.c_str());
+
+
+    m_consumer->pops(messages, 1);
+    ASSERT_EQ(messages.size(), 1);
+    m_consumer->nack(messages[0].id, true, "requeue this one"); // NACK with requeue=true
+    SWSS_LOG_NOTICE("NACKed (requeue=true) second message %s", messages[0].id.c_str());
+
+
+    int select_fd_count = 0;
+    int ret = s.select(&select_fd_count, 200); // Wait a bit
+    EXPECT_EQ(ret, Select::TIMEOUT); // NO notification should be published
+
+    // Verify CORR_META still exists and processed_count is 2, nack_flag is "0"
+    std::map<std::string, std::string> meta_map;
+    m_stateDb->getRedisContext()->hgetall(corr_meta_key, std::inserter(meta_map, meta_map.begin()));
+    ASSERT_FALSE(meta_map.empty());
+    EXPECT_EQ(meta_map[AsyncAck::FIELD_PROCESSED_MSG_COUNT], "2");
+    EXPECT_EQ(meta_map[AsyncAck::FIELD_NACK_RECEIVED_FLAG], "0");
+
+    notifier_select.unsubscribe(&sub_db, notify_channel);
+}
+
 ```

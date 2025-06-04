@@ -262,6 +262,49 @@ struct PubSubConfig {
         }
     }
 };
+
+namespace AsyncAck{
+    // Redis Pub/Sub channel prefix for async ACK notifications
+    static constexpr const char* NOTIFICATION_CHANNEL_PREFIX = "ASYNC_ACK_NOTIFY:";
+
+    // JSON field names for the notification message
+    static constexpr const char* FIELD_CORRELATION_ID = "correlation_id";
+    static constexpr const char* FIELD_STATUS = "status"; // e.g., "ALL_ACKED", "GROUP_NACKED"
+    static constexpr const char* FIELD_REASON = "reason"; // e.g., "NACK reason for a specific message"
+
+    // Status values for the notification message (can also use GroupAckStatus enum to string)
+    static constexpr const char* STATUS_ALL_ACKED = "ALL_ACKED";
+    static constexpr const char* STATUS_GROUP_NACKED = "GROUP_NACKED"; // Indicates one or more messages were terminally NACKed
+
+    // Redis key prefix for storing metadata about correlation groups
+    static constexpr const char* CORRELATION_META_PREFIX = "CORR_META:";
+    // Field names within the CORR_META hash
+    static constexpr const char* FIELD_TOTAL_MSG_COUNT = "total_msg_count";
+    static constexpr const char* FIELD_PROCESSED_MSG_COUNT = "processed_msg_count"; // ACKed or Terminally NACKed
+    static constexpr const char* FIELD_NACK_RECEIVED_FLAG = "nack_received_flag"; // "1" if any message in group was terminally NACKed
+} // namespace AsyncAck
+
+/**
+ * @brief Represents the overall acknowledgment status of a group of messages
+ *        identified by a correlation ID.
+ */
+enum class GroupAckStatus {
+    PENDING,    ///< Still awaiting ACKs/NACKs for some messages in the group.
+    ALL_ACKED,  ///< All messages in the group were successfully acknowledged.
+    GROUP_NACKED ///< At least one message in the group was terminally NACKed (and possibly sent to DLQ).
+};
+
+/**
+ * @brief Holds the final result of an asynchronous acknowledgment operation for a group of messages.
+ */
+struct FinalAckResult {
+    GroupAckStatus status = GroupAckStatus::PENDING; ///< The overall status of the group.
+    std::string nack_reason; ///< If status is GROUP_NACKED, this may contain a reason from the first terminally NACKed message.
+
+    FinalAckResult() = default;
+    FinalAckResult(GroupAckStatus s, std::string r = "") : status(s), nack_reason(std::move(r)) {}
+};
+
 } // namespace swss
 
 
