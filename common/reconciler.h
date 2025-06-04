@@ -103,10 +103,8 @@ public:
 
       // --- Determine Added and Updated items ---
       // Iterate through the desired state to find additions and updates.
-      for (const auto& pair_ref : desired_index)
+      for (const auto& [desired_key, desired_value] : desired_index)
       {
-         const auto& desired_key = pair_ref.first;
-         const auto& desired_value = pair_ref.second;
          auto it_actual = actual_index.find(desired_key);
          if (it_actual == actual_index.end())
          {
@@ -125,9 +123,10 @@ public:
 
       // --- Determine Removed items ---
       // Iterate through the actual state to find removals.
-      for (const auto& pair_ref : actual_index)
+      // Using a placeholder name for the unused value part of the pair.
+      for (const auto& [actual_key, unused_value_placeholder] : actual_index)
       {
-         const auto& actual_key = pair_ref.first;
+         // Not using unused_value_placeholder
          auto it_desired = desired_index.find(actual_key);
          if (it_desired == desired_index.end())
          {
