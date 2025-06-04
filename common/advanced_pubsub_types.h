@@ -39,12 +39,18 @@ struct Message {
 
     std::string id;
     int priority; // 0-9, 0 being lowest priority, 9 highest
-    std::string original_key; // Added to store the original key for the message
+    std::string original_key;
+    std::string original_table_name; // Table name of the original producer
     std::string content;
     std::chrono::time_point<std::chrono::system_clock> timestamp;
     int retry_count;
     std::string correlation_id;
     DeliveryMode delivery_mode;
+
+    // DLQ specific fields
+    std::string dlq_reason;
+    long long dlq_timestamp_ms = 0;
+    std::string last_nack_error_message; // Can be populated by consumer during NACK
 
     static constexpr const char* MSG_PAYLOAD_FIELD = "advanced_message_payload";
 

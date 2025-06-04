@@ -22,7 +22,11 @@ namespace swss {
             {"timestamp_ms", std::chrono::duration_cast<std::chrono::milliseconds>(m.timestamp.time_since_epoch()).count()},
             {"retry_count", m.retry_count},
             {"correlation_id", m.correlation_id},
-            {"delivery_mode", static_cast<int>(m.delivery_mode)}
+            {"delivery_mode", static_cast<int>(m.delivery_mode)},
+            {"original_table_name", m.original_table_name}, // Added original_table_name
+            {"dlq_reason", m.dlq_reason},
+            {"dlq_timestamp_ms", m.dlq_timestamp_ms},
+            {"last_nack_error_message", m.last_nack_error_message}
         };
     }
 } // namespace swss
@@ -83,6 +87,7 @@ void AdvancedProducerTable::set(const std::string& key,
     message.delivery_mode = m_delivery_mode;
     message.timestamp = std::chrono::system_clock::now();
     message.retry_count = 0;
+    message.original_table_name = this->getTableName(); // Set original_table_name
 
     // Serialize FieldValueTuple vector to a JSON string for content
     // This is a common way to store structured data in the message content.
