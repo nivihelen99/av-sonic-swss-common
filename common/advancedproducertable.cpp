@@ -50,22 +50,41 @@ std::string generate_unique_message_id() {
     // return std::to_string(nanos) + "_" + std::to_string(message_id_counter++);
 }
 
+#include "common/pubsub_config_loader.h" // For loadPubSubConfig
+
 // Constructors
-AdvancedProducerTable::AdvancedProducerTable(DBConnector* db, const std::string& tableName)
-    : ProducerTable(db, tableName), m_db(db), m_ack_db_connector(db), m_delivery_mode(common::DeliveryMode::AT_LEAST_ONCE) {
-    // m_ack_db_connector is initialized with the same DBConnector instance.
-    // If different DBs were needed for ACKs, this would be handled differently.
+AdvancedProducerTable::AdvancedProducerTable(DBConnector* db, const std::string& tableName, swss::ConfigDBConnector* configDb)
+    : ProducerTable(db, tableName), m_db(db), m_ack_db_connector(db) {
+    // m_config is default-initialized by its own default constructor.
+    if (configDb) {
+        swss::loadPubSubConfig(configDb, getTableName(), m_config);
+    }
+    m_delivery_mode = m_config.delivery_mode_enum; // Set default delivery mode from config
+    if (m_db) { // m_counters_table requires a valid DBConnector
+        m_counters_table = std::make_unique<swss::CountersTable>(m_db, swss::PubSubCounters::COUNTERS_TABLE_NAME);
+        m_counters_producer_queue_depth_key = swss::PubSubCounters::producer_queue_depth(getTableName());
+    } else {
+        SWSS_LOG_WARN("AdvancedProducerTable for table '%s': DBConnector is null, PubSub counters will be disabled.", getTableName().c_str());
+    }
+    SWSS_LOG_INFO("AdvancedProducerTable for table '%s' initialized. Default delivery mode: %d",
+                  getTableName().c_str(), static_cast<int>(m_delivery_mode));
 }
 
-AdvancedProducerTable::AdvancedProducerTable(RedisPipeline* pipeline, const std::string& tableName, bool buffered)
-    : ProducerTable(pipeline, tableName, buffered), m_db(nullptr), m_ack_db_connector(nullptr), m_delivery_mode(common::DeliveryMode::AT_LEAST_ONCE) {
-    // If using a pipeline, m_db is null. Consequently, m_ack_db_connector is also null.
-    // This means ACK tracking features requiring direct Redis access won't work with this constructor
-    // unless m_ack_db_connector is set separately or ProducerTable provides means through pipeline.
-    // For now, ACK features will be disabled or log errors if m_ack_db_connector is null.
+AdvancedProducerTable::AdvancedProducerTable(RedisPipeline* pipeline, const std::string& tableName, bool buffered, swss::ConfigDBConnector* configDb)
+    : ProducerTable(pipeline, tableName, buffered), m_db(nullptr), m_ack_db_connector(nullptr) {
+    if (configDb) {
+        swss::loadPubSubConfig(configDb, getTableName(), m_config);
+    }
+    m_delivery_mode = m_config.delivery_mode_enum;
     if (m_ack_db_connector == nullptr) {
         SWSS_LOG_WARN("AdvancedProducerTable for table '%s' initialized with RedisPipeline, ACK tracking will be disabled.", tableName.c_str());
     }
+    // Counters are disabled if m_db is null (which it is with pipeline constructor)
+    if (!m_db) {
+        SWSS_LOG_WARN("AdvancedProducerTable for table '%s' (pipeline): DBConnector is null, PubSub counters will be disabled.", getTableName().c_str());
+    }
+    SWSS_LOG_INFO("AdvancedProducerTable for table '%s' (pipeline) initialized. Default delivery mode: %d",
+                  getTableName().c_str(), static_cast<int>(m_delivery_mode));
 }
 
 // Destructor
@@ -116,10 +135,15 @@ void AdvancedProducerTable::set(const std::string& key,
     // }
 
     m_priority_queue.push(message);
+    if (m_counters_table) {
+        m_counters_table->notification_producer.inc(swss::PubSubCounters::producer_published_count(getTableName(), message.priority));
+        m_counters_table->notification_producer.set(m_counters_producer_queue_depth_key, std::to_string(m_priority_queue.size()));
+    }
 
     // Note: Base ProducerTable::set is NOT called here.
     // Messages are queued and will be sent by a separate mechanism.
-    SWSS_LOG_DEBUG("Queued message with key %s, priority %d, id %s", message.original_key.c_str(), priority, message.id.c_str());
+    SWSS_LOG_DEBUG("Queued message with key %s, priority %d, id %s. Queue depth: %zu",
+                   message.original_key.c_str(), priority, message.id.c_str(), m_priority_queue.size());
 }
 
 // Set the delivery mode
@@ -155,6 +179,9 @@ bool AdvancedProducerTable::waitForAck(const std::string& correlation_id, int ti
         if (elapsed_ms >= timeout_ms) {
             SWSS_LOG_WARN("waitForAck for table %s: Timeout for correlation ID '%s' after %lld ms.",
                           getTableName().c_str(), correlation_id.c_str(), elapsed_ms);
+            if (m_counters_table) {
+                m_counters_table->notification_producer.inc(swss::PubSubCounters::producer_ack_timeout(getTableName()));
+            }
             return false; // Timeout
         }
 
@@ -242,11 +269,44 @@ bool AdvancedProducerTable::waitForAck(const std::string& correlation_id, int ti
     return false;
 }
 
+bool AdvancedProducerTable::isRedisConnected() const {
+    if (!m_db || !m_db->getRedisContext()) {
+        SWSS_LOG_ERROR("Redis context not available for PING.");
+        return false;
+    }
+    redisReply *reply = static_cast<redisReply *>(redisCommand(m_db->getRedisContext()->getContext(), "PING"));
+    if (reply == nullptr) {
+        if (m_db->getRedisContext()->getContext() && m_db->getRedisContext()->getContext()->err) {
+            SWSS_LOG_ERROR("Redis PING command failed: %s", m_db->getRedisContext()->getContext()->errstr);
+        } else {
+            SWSS_LOG_ERROR("Redis PING command failed (reply is null), possibly disconnected.");
+        }
+        return false;
+    }
+    bool is_ok = (reply->type == REDIS_REPLY_STATUS && strcmp(reply->str, "PONG") == 0);
+    freeReplyObject(reply);
+    if (!is_ok) {
+        SWSS_LOG_WARN("Redis PING did not return PONG.");
+    }
+    return is_ok;
+}
+
 // Flushes messages from the priority queue to Redis
 void AdvancedProducerTable::flushPriorityQueue() {
+    if (m_priority_queue.empty()) {
+        return;
+    }
     SWSS_LOG_INFO("Flushing priority queue for table %s, current size: %zu", getTableName().c_str(), m_priority_queue.size());
+
+    // Check connectivity before attempting to flush numerous messages
+    if (!isRedisConnected()) {
+        SWSS_LOG_ERROR("Cannot flush priority queue for table %s: Redis is not connected.", getTableName().c_str());
+        // Depending on policy, messages could be re-queued or held. For now, they remain in m_priority_queue.
+        return;
+    }
+
     while (!m_priority_queue.empty()) {
-        common::Message msg_to_send = m_priority_queue.pop(); // pop() also removes the element
+        common::Message msg_to_send = m_priority_queue.pop();
 
         SWSS_LOG_DEBUG("Processing message ID %s, Key %s, Priority %d for table %s for actual sending.",
                        msg_to_send.id.c_str(), msg_to_send.original_key.c_str(), msg_to_send.priority, getTableName().c_str());
