@@ -1,0 +1,14 @@
+{
+    "INCLUDES": [],
+    "LOOPBACK_INTERFACES": {},
+    "MGMT_INTERFACE": {},
+    "MINIGRAPH_HWPORTS": {},
+    "MUX_HWPORTS": {},
+    "PORTCHANNEL_INTERFACES": {},
+    "VLAN_INTERFACES": {},
+    "EVENTS": {
+        "xpub_path": "inproc://eventbus_bridge_test",
+        "xsub_path": "inproc://eventbus_bridge_test_xsub",
+        "req_rep_path": "inproc://eventbus_bridge_test_reqrep"
+    }
+}

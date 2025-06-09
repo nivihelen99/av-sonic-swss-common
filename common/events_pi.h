@@ -18,6 +18,7 @@
 #include "events_common.h"
 #include "events_service.h"
 #include "events_wrap.h"
+#include "common/eventbus.h" // Added for common::EventBus
 
 using namespace std;
 
@@ -103,6 +104,8 @@ class EventSubscriber : public events_base
 
         static EventSubscriber_ptr_t get_instance(event_handle_t handle);
 
+        void set_local_eventbus(std::shared_ptr<common::EventBus> bus); // Added
+
         int event_receive(event_receive_op_t &);
         int event_receive(event_receive_op_C_t &);
         int event_receive(string &event_str, uint32_t &missed, int64_t &pub_ms);
@@ -152,6 +155,7 @@ class EventSubscriber : public events_base
          */
         event_serialized_lst_t m_from_cache;
 
+        std::shared_ptr<common::EventBus> m_local_event_bus; // Added
 };
 
 /*

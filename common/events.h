@@ -139,6 +139,52 @@ int event_publish(event_handle_t handle, const std::string event_tag,
  * Return:
  *  Non NULL handle on success
  *  NULL on failure
+ *
+ * ZMQ to In-Process EventBus Bridge (C++ Usage):
+ *  The EventSubscriber can be configured to automatically publish received ZMQ events
+ *  to an instance of `common::EventBus` (see `common/eventbus.h` and `common/EVENT_BUS.md`).
+ *  This allows bridging events from the ZMQ-based IPC mechanism to the in-process bus.
+ *
+ *  To enable this bridge:
+ *  1. Initialize the EventSubscriber using `events_init_subscriber()`.
+ *  2. Obtain a `std::shared_ptr<EventSubscriber>` (e.g., using `EventSubscriber::get_instance(handle)`).
+ *     This requires including `common/events_pi.h` for the `EventSubscriber` class definition.
+ *  3. Create a `std::shared_ptr<common::EventBus>`.
+ *  4. Call the `set_local_eventbus(your_event_bus_ptr)` method on the `EventSubscriber` instance.
+ *
+ *  Event Mapping to `common::EventBus`:
+ *  - Topic: The ZMQ event's composite key (typically "event_source:event_tag",
+ *    e.g., "sonic-events-bgp:bgp-state") is used as the topic string for `common::EventBus::Event`.
+ *  - Data: The ZMQ event's parameters (`event_params_t`, which is `std::map<std::string, std::string>`)
+ *    are wrapped in `std::any` and set as the data payload of the `common::EventBus::Event`.
+ *    Subscribers on the local `common::EventBus` will need to `std::any_cast` this data
+ *    back to `event_params_t`.
+ *
+ *  Example (Conceptual C++):
+ *  ```cpp
+ *  #include "common/events.h"
+ *  #include "common/events_pi.h" // For EventSubscriber class
+ *  #include "common/eventbus.h"  // For common::EventBus
+ *  #include <memory>
+ *
+ *  // ...
+ *  event_handle_t handle = events_init_subscriber(false, -1, nullptr);
+ *  if (handle) {
+ *      std::shared_ptr<EventSubscriber> sub_instance = EventSubscriber::get_instance(handle);
+ *      if (sub_instance) {
+ *          std::shared_ptr<common::EventBus> local_bus = std::make_shared<common::EventBus>();
+ *          sub_instance->set_local_eventbus(local_bus);
+ *
+ *          local_bus->subscribe("some_source:some_tag", [](const common::Event& event){
+ *              auto params = std::any_cast<event_params_t>(event.data);
+ *              // Process event from ZMQ, now on local bus
+ *          });
+ *      }
+ *      // ... proceed to call event_receive(handle, ...) or integrate into an event loop ...
+ *  }
+ *  ```
+ * When `event_receive()` is called on the handle, if a local event bus is set,
+ * the parsed event will also be published to it.
  */
 typedef std::vector<std::string> event_subscribe_sources_t;
 

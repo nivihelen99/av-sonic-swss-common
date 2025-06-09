@@ -276,8 +276,13 @@ out:
 }
 
 EventSubscriber::EventSubscriber(): m_zmq_ctx(NULL), m_socket(NULL),
-    m_cache_read(false)
+    m_cache_read(false), m_local_event_bus(nullptr) // Initialize new member
 {}
+
+void EventSubscriber::set_local_eventbus(std::shared_ptr<common::EventBus> bus)
+{
+    m_local_event_bus = bus;
+}
 
 
 EventSubscriber::~EventSubscriber()
@@ -460,6 +465,18 @@ EventSubscriber::event_receive(event_receive_op_t &op)
 
     rc = convert_from_json(event_str, op.key, op.params);
     RET_ON_ERR(rc == 0, "failed to parse %s", event_str.c_str());
+
+    if (rc == 0 && m_local_event_bus) {
+        try {
+            // op.params is std::map<std::string, std::string>
+            // common::Event constructor takes std::string topic, std::any data
+            common::Event bus_event(op.key, std::any(op.params));
+            m_local_event_bus->publish(bus_event);
+        } catch (const std::exception& e) {
+            SWSS_LOG_ERROR("Failed to publish event to local EventBus: %s", e.what());
+            // Not returning or changing 'rc' here, as publishing to local bus is optional.
+        }
+    }
 out:
     return rc;
 }

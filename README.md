@@ -18,6 +18,15 @@
 ## Description
 The SWitch State Service (SWSS) common library provides libraries for database communications, netlink wrappers, and other functions needed by SWSS.
 
+### Key Features
+Beyond database and Netlink utilities, SWSS Common also includes:
+- **Table Management:** Classes for interacting with Redis database tables (`Table`, `ConsumerTable`, `ProducerTable`, etc.).
+- **Event System (ZMQ-based):** A system for inter-process communication using ZMQ events, allowing different services to publish and subscribe to system-wide events (see `common/events.h`).
+- **In-Process EventBus:** A lightweight, typed event bus for in-process communication. This allows different components within a single process to subscribe and publish events locally. See [common/EVENT_BUS.md](common/EVENT_BUS.md) for details.
+- **ZMQ-EventBus Bridge:** The ZMQ-based `EventSubscriber` can be configured to automatically forward received ZMQ events to an instance of the in-process EventBus. This feature bridges events from the system-wide ZMQ mechanism to the local in-process bus. See documentation in `common/events.h` (under `events_init_subscriber`) for usage.
+- **Python Bindings:** Python wrappers for many of the C++ utilities.
+- **Logging Utilities:** Standardized logging mechanisms.
+
 ## Getting Started
 
 ### Build from Source
