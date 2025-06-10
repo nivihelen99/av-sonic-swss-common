@@ -81,7 +81,11 @@ common_libswsscommon_la_SOURCES = \
     common/c-api/zmqproducerstatetable.cpp \
     common/c-api/table.cpp                 \
     common/c-api/logger.cpp \
-    common/performancetimer.cpp
+    common/performancetimer.cpp \
+    common/topiceventsubscriber.cpp \
+    common/topiceventsubscriber.h \
+    common/filterednotificationconsumer.cpp \
+    common/filterednotificationconsumer.h
 
 common_libswsscommon_la_CXXFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(LIBNL_CFLAGS) $(CODE_COVERAGE_CXXFLAGS)
 common_libswsscommon_la_CPPFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(LIBNL_CPPFLAGS) $(CODE_COVERAGE_CPPFLAGS)

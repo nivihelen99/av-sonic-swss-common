@@ -64,6 +64,7 @@ typedef std::map<std::string, std::string> event_params_t;
  * timestamp param name
  */
 #define EVENT_TS_PARAM "timestamp"
+const std::string EVENT_PARAM_ENTITY_ID = "entity_id";
 
 /*
  * Publish an event

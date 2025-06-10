@@ -44,10 +44,12 @@
 #include "decoratorsubscriberstatetable.h"
 #endif
 #include "notificationconsumer.h"
+#include "common/filterednotificationconsumer.h"
 #include "notificationproducer.h"
 #include "warm_restart.h"
 #include "logger.h"
 #include "events.h"
+#include "common/topiceventsubscriber.h"
 #include "configdb.h"
 #include "status_code_util.h"
 #include "redis_table_waiter.h"
@@ -346,6 +348,7 @@ T castSelectableObj(swss::Selectable *temp)
 %apply std::string& OUTPUT {std::string &data};
 %apply std::vector<std::pair<std::string, std::string>>& OUTPUT {std::vector<std::pair<std::string, std::string>> &values};
 %include "notificationconsumer.h"
+%include "common/filterednotificationconsumer.h"
 %clear std::string &op;
 %clear std::string &data;
 %clear std::vector<std::pair<std::string, std::string>> &values;
@@ -355,6 +358,7 @@ T castSelectableObj(swss::Selectable *temp)
 %include "dbinterface.h"
 %include "logger.h"
 %include "events.h"
+%include "common/topiceventsubscriber.h"
 
 %include "status_code_util.h"
 #include "redis_table_waiter.h"
